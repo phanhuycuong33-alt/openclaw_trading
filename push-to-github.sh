@@ -32,14 +32,34 @@ echo "=========================================="
 echo "Repository: $REPO_URL"
 echo ""
 
-# Add remote
-echo "[1/3] Adding remote origin..."
-git remote add origin "$REPO_URL"
+# Add or update remote
+echo "[1/3] Configuring remote origin..."
+if git remote get-url origin >/dev/null 2>&1; then
+    git remote set-url origin "$REPO_URL"
+    echo "Updated existing origin URL"
+else
+    git remote add origin "$REPO_URL"
+    echo "Added new origin URL"
+fi
 git remote -v
 
 echo ""
-echo "[2/3] Pushing master branch..."
-git push -u origin master
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+echo "[2/3] Pushing $CURRENT_BRANCH branch..."
+if ! git push -u origin "$CURRENT_BRANCH"; then
+    echo ""
+    echo "❌ Push failed. Common reasons:"
+    echo "  - Repository does not exist on GitHub yet"
+    echo "  - Wrong owner/repo name in URL"
+    echo "  - You do not have access to this repository"
+    echo "  - Authentication token/login expired"
+    echo ""
+    echo "Fix:"
+    echo "  1) Create repo at https://github.com/new"
+    echo "  2) Use exact URL from GitHub"
+    echo "  3) Re-run: bash push-to-github.sh <github-repo-url>"
+    exit 1
+fi
 
 echo ""
 echo "[3/3] Verification..."
