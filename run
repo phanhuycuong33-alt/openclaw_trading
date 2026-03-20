@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+if [[ ! -d ".venv" ]]; then
+  python3 -m venv .venv
+fi
+
+source .venv/bin/activate
+pip install -r requirements.txt >/dev/null
+
+app="${1:-openclaw}"
+action="${2:-analysis}"
+
+if [[ "$app" != "openclaw" ]]; then
+  echo "Usage: ./run openclaw [analysis|trading|telegram]"
+  exit 1
+fi
+
+case "$action" in
+  analysis)
+    exec python main.py
+    ;;
+  trading)
+    exec python trade_openclaw.py
+    ;;
+  telegram)
+    exec python telegram_control.py
+    ;;
+  *)
+    echo "Usage: ./run openclaw [analysis|trading|telegram]"
+    exit 1
+    ;;
+esac
