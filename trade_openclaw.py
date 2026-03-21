@@ -7,6 +7,7 @@ from typing import Any
 from src.analyzer import score_coins
 from src.binance_trader import BinanceFuturesTrader
 from src.config import load_settings
+from src.second_advisor import rerank_with_second_advisor
 from src.trading_strategy import choose_side, choose_trade_candidate, compute_tp_sl
 from src.web_fetcher import fetch_markets, fetch_trending
 
@@ -59,6 +60,7 @@ def run_trading() -> dict[str, Any]:
 
     markets = fetch_markets(vs_currency=settings.vs_currency, per_page=120)
     ranked = score_coins(markets, trending_ids)
+    ranked = rerank_with_second_advisor(ranked)
 
     if not ranked:
         raise RuntimeError("Không lấy được dữ liệu thị trường")

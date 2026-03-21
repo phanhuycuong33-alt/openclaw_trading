@@ -14,6 +14,7 @@ from src.config import load_settings
 from src.binance_trader import BinanceFuturesTrader
 from src.claude_client import review_positions_with_claude
 from src.ecommerce_scanner import run_sell_scan
+from src.second_advisor import rerank_with_second_advisor
 from src.trading_strategy import choose_side, compute_tp_sl
 from src.usage_tracker import get_copilot_usage
 from src.web_fetcher import fetch_markets, fetch_trending
@@ -706,6 +707,7 @@ def _build_cycle_trades(leverage_override: int | None = None) -> dict[str, Any]:
     trending_ids = {coin["id"] for coin in trending if coin.get("id")}
     markets = fetch_markets(vs_currency=settings.vs_currency, per_page=120)
     ranked = score_coins(markets, trending_ids)
+    ranked = rerank_with_second_advisor(ranked)
     if not ranked:
         raise RuntimeError("Không có dữ liệu thị trường để chọn coin")
 
