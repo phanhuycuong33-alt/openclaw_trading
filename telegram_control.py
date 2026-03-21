@@ -112,6 +112,16 @@ def _choose_adaptive_leverage(coin_data: dict[str, Any], settings: Any) -> int:
     return max(2 if base_leverage >= 2 else 1, min(leverage, base_leverage))
 
 
+def _resolve_trade_leverage(
+    coin_data: dict[str, Any],
+    settings: Any,
+    leverage_override: int | None = None,
+) -> int:
+    if leverage_override is not None:
+        return max(1, int(leverage_override))
+    return _choose_adaptive_leverage(coin_data, settings)
+
+
 # ---------------------------------------------------------------------------
 # Adaptive review analysis (rule-based + optional Claude override)
 # ---------------------------------------------------------------------------
@@ -319,6 +329,7 @@ def _open_single_replacement_trade(
     settings: Any,
     allocated_margin: float,
     fresh_ranked: list[dict[str, Any]],
+    leverage_override: int | None = None,
 ) -> dict[str, Any] | None:
     """Find the candidate data for replacement_symbol, build and execute its trade plan.
     Returns an active_trades-compatible dict, or None on failure."""
@@ -335,7 +346,7 @@ def _open_single_replacement_trade(
         return None
 
     try:
-        leverage = _choose_adaptive_leverage(coin_data, settings)
+        leverage = _resolve_trade_leverage(coin_data, settings, leverage_override)
         min_margin = trader.get_min_trade_margin(replacement_symbol, leverage, base_usdt_amount=1.0)
         allocated_margin = max(float(allocated_margin), float(min_margin))
         side = choose_side(coin_data)
@@ -387,6 +398,7 @@ def _auto_execute_review_actions(
     token: str,
     chat_id: str,
     fresh_ranked: list[dict[str, Any]],
+    leverage_override: int | None = None,
 ) -> list[dict[str, Any]]:
     """Execute all non-HOLD recommendations immediately.
     Returns an updated active_trades list."""
@@ -440,6 +452,7 @@ def _auto_execute_review_actions(
                     settings=settings,
                     allocated_margin=replacement_margin,
                     fresh_ranked=fresh_ranked,
+                    leverage_override=leverage_override,
                 )
                 if new_trade:
                     new_active_trades.append(new_trade)
@@ -606,7 +619,7 @@ def _pick_supported_candidates(
     return selected
 
 
-def _build_cycle_trades() -> dict[str, Any]:
+def _build_cycle_trades(leverage_override: int | None = None) -> dict[str, Any]:
     settings = load_settings()
     fallback_reason = ""
     effective_dry_run = settings.dry_run
@@ -668,7 +681,7 @@ def _build_cycle_trades() -> dict[str, Any]:
     budget_used = 0.0
 
     for coin, symbol in candidates:
-        leverage = _choose_adaptive_leverage(coin, settings)
+        leverage = _resolve_trade_leverage(coin, settings, leverage_override)
         side = choose_side(coin)
         current_price = float(coin.get("current_price") or 0.0)
         tp_price, sl_price = compute_tp_sl(
@@ -863,6 +876,7 @@ def _try_top_up_portfolio(
     settings: Any,
     active_trades: list[dict[str, Any]],
     fresh_ranked: list[dict[str, Any]],
+    leverage_override: int | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     opened_trades: list[dict[str, Any]] = []
     log_lines: list[str] = []
@@ -888,7 +902,7 @@ def _try_top_up_portfolio(
         try:
             required_margin = trader.get_min_trade_margin(
                 symbol=symbol,
-                leverage=settings.leverage,
+                leverage=max(1, int(leverage_override or settings.leverage)),
                 base_usdt_amount=1.0,
             )
             if required_margin > available_balance:
@@ -900,6 +914,7 @@ def _try_top_up_portfolio(
                 settings=settings,
                 allocated_margin=required_margin,
                 fresh_ranked=fresh_ranked,
+                leverage_override=leverage_override,
             )
             if not new_trade:
                 log_lines.append(f"  ↳ Retry mở {symbol} thất bại")
@@ -926,6 +941,7 @@ def _run_multi_trade_cycle(
     stop_event: threading.Event,
     close_target_usdt: float,
     review_after_sec: int | None = None,
+    leverage_override: int | None = None,
 ) -> None:
     settings = load_settings()
     accumulated_realized_pnl = 0.0
@@ -935,7 +951,7 @@ def _run_multi_trade_cycle(
         cycle_index += 1
 
         try:
-            batch = _build_cycle_trades()
+            batch = _build_cycle_trades(leverage_override=leverage_override)
         except Exception as exc:
             _send_message(token, chat_id, f"Không thể bắt đầu batch trade: {exc}")
             for _ in range(settings.telegram_poll_interval_sec):
@@ -966,6 +982,7 @@ def _run_multi_trade_cycle(
             f"Budget used: {budget_used:.4f} | Reserve: {reserve_balance:.4f} | Remaining: {remaining_budget:.4f}",
             f"Close condition: tổng pnl >= {close_target_usdt:.4f} USDT",
             f"Adaptive review (AI tự động): sau {effective_review_after_sec}s nếu PnL âm",
+            f"Leverage override: {leverage_override}x" if leverage_override is not None else f"Leverage mode: adaptive <= {settings.leverage}x",
         ]
         if fallback_reason:
             header_lines.append(f"Fallback: {fallback_reason}")
@@ -1068,6 +1085,7 @@ def _run_multi_trade_cycle(
                             token=token,
                             chat_id=chat_id,
                             fresh_ranked=fresh_ranked,
+                            leverage_override=leverage_override,
                         )
 
                         if active_trades:
@@ -1243,7 +1261,7 @@ def _handle_command(text: str) -> tuple[str, bool, dict[str, Any] | None, bool]:
     if command in {"/start", "/help"}:
         return (
             "Commands:\n"
-            "/trade hoặc /trade <target_usdt> [review_after_sec] (multi-coin cycle)\n"
+            "/trade hoặc /trade <target_usdt> [review_after_sec] [leverage] (multi-coin cycle)\n"
             "/run openclaw trading (single trade)\n"
             "/status\n/aiusage\n/stop"
         ), False, None, False
@@ -1353,6 +1371,7 @@ def run_telegram_bot() -> None:
                             parts = text.strip().split()
                             target_usdt = settings.profit_reenter_usdt
                             review_after_sec: int | None = None
+                            leverage_override: int | None = None
 
                             if len(parts) >= 2:
                                 try:
@@ -1376,6 +1395,17 @@ def run_telegram_bot() -> None:
                                     _send_message(token, chat_id, "Sai format. Dùng: /trade hoặc /trade 0.1 15")
                                     continue
 
+                            if len(parts) >= 4:
+                                try:
+                                    parsed_leverage = int(parts[3])
+                                    if parsed_leverage <= 0:
+                                        _send_message(token, chat_id, "leverage phải > 0. Ví dụ: /trade 0.1 500 10")
+                                        continue
+                                    leverage_override = parsed_leverage
+                                except ValueError:
+                                    _send_message(token, chat_id, "Sai format. Dùng: /trade hoặc /trade 0.1 500 10")
+                                    continue
+
                             if cycle_thread is not None and cycle_thread.is_alive():
                                 _send_message(token, chat_id, "⏳ Multi-coin cycle đang chạy, vui lòng chờ hoặc dùng /stop.")
                                 continue
@@ -1385,6 +1415,11 @@ def run_telegram_bot() -> None:
                                 if review_after_sec is not None
                                 else f"{settings.adaptive_review_min * 60}s"
                             )
+                            leverage_text = (
+                                f"{leverage_override}x"
+                                if leverage_override is not None
+                                else f"adaptive <= {settings.leverage}x"
+                            )
 
                             _send_message(
                                 token,
@@ -1393,12 +1428,13 @@ def run_telegram_bot() -> None:
                                     "Đang khởi động multi-coin cycle: chọn coin theo số dư, "
                                     f"report PnL mỗi {settings.pnl_refresh_sec}s, "
                                     f"close all khi tổng pnl >= {target_usdt:.4f} USDT. "
-                                    f"AI tự rotate coin nếu PnL âm sau {review_text}."
+                                    f"AI tự rotate coin nếu PnL âm sau {review_text}. "
+                                    f"Leverage: {leverage_text}."
                                 ),
                             )
                             cycle_thread = threading.Thread(
                                 target=_run_multi_trade_cycle,
-                                args=(token, chat_id, stop_event, target_usdt, review_after_sec),
+                                args=(token, chat_id, stop_event, target_usdt, review_after_sec, leverage_override),
                                 daemon=True,
                             )
                             cycle_thread.start()
