@@ -12,50 +12,11 @@ import requests
 from src.analyzer import score_coins
 from src.config import load_settings
 from src.binance_trader import BinanceFuturesTrader
+from src.claude_client import review_positions_with_claude
 from src.trading_strategy import choose_side, compute_tp_sl
 from src.usage_tracker import get_copilot_usage
 from src.web_fetcher import fetch_markets, fetch_trending
 from trade_openclaw import run_trading
-
-
-# ---------------------------------------------------------------------------
-# Adaptive Review State – shared between polling loop and cycle thread
-# ---------------------------------------------------------------------------
-
-class AdaptiveReviewState:
-    """Coordinates an adaptive review between the monitoring cycle thread
-    and the main Telegram polling loop."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self.pending: dict[str, Any] | None = None       # set by cycle thread
-        self.user_response: str | None = None             # set by polling thread
-        self._event = threading.Event()
-
-    def set_pending(self, review_data: dict[str, Any]) -> None:
-        with self._lock:
-            self.pending = review_data
-            self.user_response = None
-            self._event.clear()
-
-    def respond(self, response: str) -> None:
-        with self._lock:
-            self.user_response = response.strip().lower()
-            self._event.set()
-
-    def clear(self) -> None:
-        with self._lock:
-            self.pending = None
-            self.user_response = None
-            self._event.clear()
-
-    def is_pending(self) -> bool:
-        with self._lock:
-            return self.pending is not None
-
-    def wait_for_response(self, timeout_sec: float) -> bool:
-        """Block until user responds or timeout. Returns True if user responded."""
-        return self._event.wait(timeout=timeout_sec)
 
 
 # ---------------------------------------------------------------------------
@@ -67,13 +28,8 @@ def _estimate_close_fee(qty: float, mark_price: float, fee_rate: float) -> float
     return abs(qty) * mark_price * fee_rate
 
 
-def _estimate_round_trip_fee(qty: float, mark_price: float, fee_rate: float) -> float:
-    """Two-side taker fee: close existing + open replacement."""
-    return abs(qty) * mark_price * fee_rate * 2.0
-
-
 # ---------------------------------------------------------------------------
-# Adaptive review analysis (rule-based, no LLM quota spend)
+# Adaptive review analysis (rule-based + optional Claude override)
 # ---------------------------------------------------------------------------
 
 def _build_adaptive_review_recommendations(
@@ -81,17 +37,11 @@ def _build_adaptive_review_recommendations(
     live_pnl_trader: "BinanceFuturesTrader | None",
     price_trader: "BinanceFuturesTrader",
     settings: Any,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
     """
     Analyse each active trade and build per-coin recommendations.
 
-    Returns
-    -------
-    recommendations : list of per-coin dicts with keys:
-        index, symbol, side, current_pnl, mark_price, qty, notional,
-        close_fee_est, net_pnl_if_close, action, reason,
-        replacement_symbol (optional), replacement_score (optional)
-    fresh_ranked : the fresh full scored list (for picking replacements later)
+    Returns: (recommendations, fresh_ranked, llm_source_label)
     """
     from src.web_fetcher import fetch_markets, fetch_trending
 
@@ -251,47 +201,28 @@ def _build_adaptive_review_recommendations(
             }
         )
 
-    return recommendations, fresh_ranked
+    llm_source = "rule-based"
+    if settings.llm_provider == "anthropic" and settings.anthropic_api_key:
+        try:
+            llm_overrides = review_positions_with_claude(
+                api_key=settings.anthropic_api_key,
+                model=settings.model,
+                positions=recommendations,
+                fresh_market_summary=fresh_ranked[:20],
+            )
+            if llm_overrides:
+                for rec in recommendations:
+                    symbol = str(rec.get("symbol") or "").upper()
+                    new_action = llm_overrides.get(symbol)
+                    if new_action and new_action != rec.get("action"):
+                        old_action = str(rec.get("action") or "")
+                        rec["action"] = new_action
+                        rec["reason"] = f"[Claude: {old_action} → {new_action}] {rec['reason']}"
+                llm_source = "Claude AI"
+        except Exception:
+            pass
 
-
-def _format_adaptive_review_message(
-    recommendations: list[dict[str, Any]],
-    elapsed_min: int,
-    total_pnl: float,
-) -> str:
-    lines = [
-        f"🔍 ADAPTIVE REVIEW sau {elapsed_min} phút (PnL tổng: {total_pnl:+.4f} USDT)",
-        "Phân tích từng vị thế và đề xuất hành động:",
-        "",
-    ]
-
-    total_close_fee = 0.0
-    for rec in recommendations:
-        action_label = {
-            "CLOSE_REPLACE": "⟳ ĐÓNG & THAY THẾ",
-            "CLOSE_CUT_LOSS": "✂ CẮT LỖ",
-            "HOLD": "⏸ GIỮ NGUYÊN",
-        }.get(rec["action"], rec["action"])
-
-        lines.append(f"[{rec['index']}] {rec['symbol']} ({rec['side']}) — {action_label}")
-        lines.append(f"    PnL thực: {rec['current_pnl']:+.4f} | Phí close ≈ {rec['close_fee_est']:.4f} | Net: {rec['net_pnl_if_close']:+.4f}")
-        lines.append(f"    {rec['reason']}")
-        if rec["action"] in {"CLOSE_REPLACE"} and rec.get("replacement_symbol"):
-            lines.append(f"    → Thay bằng: {rec['replacement_symbol']} (score {rec['replacement_score']:.3f})")
-        lines.append("")
-
-        if rec["action"] in {"CLOSE_REPLACE", "CLOSE_CUT_LOSS"}:
-            total_close_fee += rec["close_fee_est"]
-
-    lines.append(f"Tổng phí ước tính (close): {total_close_fee:.4f} USDT")
-    lines.append("")
-    lines.append("Quyết định của bạn:")
-    lines.append("  /review yes  → thực hiện TẤT CẢ đề xuất trên")
-    lines.append("  /review no   → bỏ qua, tiếp tục monitor")
-    lines.append("  /review 1,3  → chỉ thực hiện coin số 1 và 3")
-    lines.append("  (Tự động bỏ qua sau 5 phút nếu không phản hồi)")
-
-    return "\n".join(lines)
+    return recommendations, fresh_ranked, llm_source
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +251,8 @@ def _open_single_replacement_trade(
         return None
 
     try:
+        min_margin = trader.get_min_trade_margin(replacement_symbol, settings.leverage, base_usdt_amount=1.0)
+        allocated_margin = max(float(allocated_margin), float(min_margin))
         side = choose_side(coin_data)
         current_price = float(coin_data.get("current_price") or 0.0)
         tp_price, sl_price = compute_tp_sl(
@@ -358,11 +291,10 @@ def _open_single_replacement_trade(
 
 
 # ---------------------------------------------------------------------------
-# Execute review actions chosen by user
+# Execute review actions automatically
 # ---------------------------------------------------------------------------
 
-def _execute_review_actions(
-    user_choice: str,
+def _auto_execute_review_actions(
     recommendations: list[dict[str, Any]],
     active_trades: list[dict[str, Any]],
     live_trader: "BinanceFuturesTrader",
@@ -371,38 +303,19 @@ def _execute_review_actions(
     chat_id: str,
     fresh_ranked: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Execute the user-confirmed subset of recommendations.
+    """Execute all non-HOLD recommendations immediately.
     Returns an updated active_trades list."""
-
-    # Parse which indices to execute
-    if user_choice in {"yes", "all"}:
-        selected_indices = {rec["index"] for rec in recommendations if rec["action"] != "HOLD"}
-    elif user_choice in {"no", "skip"}:
-        _send_message(token, chat_id, "⏸ Bỏ qua review – tiếp tục monitor.")
-        return active_trades
-    else:
-        # Parse "1,3" or "1 3" etc.
-        selected_indices: set[int] = set()
-        for part in user_choice.replace(",", " ").split():
-            try:
-                selected_indices.add(int(part))
-            except ValueError:
-                pass
-        if not selected_indices:
-            _send_message(token, chat_id, "Không hiểu lựa chọn, bỏ qua review.")
-            return active_trades
 
     executed_lines: list[str] = []
     new_active_trades: list[dict[str, Any]] = []
-    closed_symbols: set[str] = set()
 
     for rec in recommendations:
-        if rec["index"] not in selected_indices:
+        action = rec.get("action")
+        if action == "HOLD":
             new_active_trades.append(active_trades[rec["index"] - 1])
             continue
 
         symbol = rec["symbol"]
-        action = rec["action"]
         is_paper = rec["is_paper"]
 
         # Close the position
@@ -411,7 +324,6 @@ def _execute_review_actions(
             try:
                 live_trader.close_position_market(symbol)
                 close_ok = True
-                closed_symbols.add(symbol)
                 executed_lines.append(f"✅ Đã close {symbol} (PnL {rec['current_pnl']:+.4f})")
             except Exception as exc:
                 executed_lines.append(f"❌ Lỗi close {symbol}: {exc}")
@@ -443,7 +355,11 @@ def _execute_review_actions(
             except Exception as exc:
                 executed_lines.append(f"  ↳ Lỗi mở {rep_sym}: {exc}")
 
-    summary = "Review thực hiện xong:\n" + "\n".join(executed_lines)
+    if not executed_lines:
+        _send_message(token, chat_id, "Adaptive review: không có vị thế cần đóng/thay thế.")
+        return active_trades
+
+    summary = "Adaptive review tự động đã thực hiện:\n" + "\n".join(executed_lines)
     _send_message(token, chat_id, summary)
     return new_active_trades
 
@@ -801,7 +717,6 @@ def _run_multi_trade_cycle(
     chat_id: str,
     stop_event: threading.Event,
     close_target_usdt: float,
-    review_state: "AdaptiveReviewState | None" = None,
 ) -> None:
     settings = load_settings()
     accumulated_realized_pnl = 0.0
@@ -840,7 +755,7 @@ def _run_multi_trade_cycle(
             f"Balance: {available_balance:.4f} USDT | Opened: {len(active_trades)} lệnh | Coins: {symbols_text}",
             f"Budget used: {budget_used:.4f} | Reserve: {reserve_balance:.4f} | Remaining: {remaining_budget:.4f}",
             f"Close condition: tổng pnl >= {close_target_usdt:.4f} USDT",
-            f"Adaptive review: sau {settings.adaptive_review_min} phút nếu PnL âm",
+            f"Adaptive review (AI tự động): sau {settings.adaptive_review_min} phút nếu PnL âm",
         ]
         if fallback_reason:
             header_lines.append(f"Fallback: {fallback_reason}")
@@ -910,69 +825,53 @@ def _run_multi_trade_cycle(
                     "Đang phân tích từng vị thế...",
                 )
                 try:
-                    recommendations, fresh_ranked = _build_adaptive_review_recommendations(
+                    recommendations, fresh_ranked, llm_src = _build_adaptive_review_recommendations(
                         active_trades,
                         live_pnl_trader,
                         price_trader,
                         settings,
                     )
-                    review_msg = _format_adaptive_review_message(
-                        recommendations, elapsed_min, total_pnl
+                    action_summary = ", ".join(
+                        f"{rec['symbol']}={rec['action']}" for rec in recommendations
                     )
-                    _send_message(token, chat_id, review_msg)
+                    _send_message(
+                        token,
+                        chat_id,
+                        (
+                            f"🧠 Adaptive review ({llm_src}) sau {elapsed_min} phút: {action_summary}. "
+                            "Đang tự động thực thi..."
+                        ),
+                    )
 
-                    if review_state is not None:
-                        review_state.set_pending(
-                            {
-                                "recommendations": recommendations,
-                                "fresh_ranked": fresh_ranked,
-                                "active_trades_snapshot": list(active_trades),
-                            }
+                    first_plan = active_trades[0].get("trade_plan", {}) if active_trades else {}
+                    is_paper = bool(first_plan.get("dry_run"))
+                    exec_trader = live_pnl_trader if (live_pnl_trader and not is_paper) else price_trader
+                    active_trades = _auto_execute_review_actions(
+                        recommendations=recommendations,
+                        active_trades=active_trades,
+                        live_trader=exec_trader,
+                        settings=settings,
+                        token=token,
+                        chat_id=chat_id,
+                        fresh_ranked=fresh_ranked,
+                    )
+
+                    if active_trades:
+                        new_symbols = ", ".join(
+                            str(t.get("trade_plan", {}).get("symbol") or "") for t in active_trades
                         )
-                        # Wait up to 5 minutes for user decision
-                        responded = review_state.wait_for_response(timeout_sec=300)
-                        user_choice = review_state.user_response if responded else "no"
-
-                        if not responded:
-                            _send_message(
-                                token,
-                                chat_id,
-                                "⏱ Không có phản hồi sau 5 phút – bỏ qua review, tiếp tục monitor.",
-                            )
-
-                        review_state.clear()
-
-                        if user_choice and user_choice not in {"no", "skip"}:
-                            first_plan = active_trades[0].get("trade_plan", {}) if active_trades else {}
-                            is_paper = bool(first_plan.get("dry_run"))
-                            exec_trader = live_pnl_trader if (live_pnl_trader and not is_paper) else price_trader
-                            active_trades = _execute_review_actions(
-                                user_choice=user_choice,
-                                recommendations=recommendations,
-                                active_trades=active_trades,
-                                live_trader=exec_trader,
-                                settings=settings,
-                                token=token,
-                                chat_id=chat_id,
-                                fresh_ranked=fresh_ranked,
-                            )
-                            if active_trades:
-                                new_symbols = ", ".join(
-                                    str(t.get("trade_plan", {}).get("symbol") or "") for t in active_trades
-                                )
-                                _send_message(
-                                    token,
-                                    chat_id,
-                                    f"Portfolio sau review: {new_symbols} ({len(active_trades)} vị thế)",
-                                )
-                            else:
-                                _send_message(
-                                    token,
-                                    chat_id,
-                                    "Tất cả vị thế đã đóng sau review – bắt đầu batch mới.",
-                                )
-                                break  # restart outer while loop to open new batch
-                    # If no review_state provided, just leave the message and continue
+                        _send_message(
+                            token,
+                            chat_id,
+                            f"Portfolio sau adaptive review: {new_symbols} ({len(active_trades)} vị thế)",
+                        )
+                    else:
+                        _send_message(
+                            token,
+                            chat_id,
+                            "Tất cả vị thế đã đóng sau adaptive review – bắt đầu batch mới.",
+                        )
+                        break  # restart outer while loop to open new batch
                 except Exception as exc:
                     _send_message(token, chat_id, f"Lỗi adaptive review: {exc}")
 
@@ -1120,8 +1019,7 @@ def _handle_command(text: str) -> tuple[str, bool, dict[str, Any] | None, bool]:
             "Commands:\n"
             "/trade hoặc /trade <target_usdt> (multi-coin cycle)\n"
             "/run openclaw trading (single trade)\n"
-            "/status\n/aiusage\n/stop\n"
-            "/review yes|no|<số> (phản hồi adaptive review khi đang chờ)"
+            "/status\n/aiusage\n/stop"
         ), False, None, False
 
     if command == "/status":
@@ -1164,7 +1062,6 @@ def run_telegram_bot() -> None:
     stop_event = threading.Event()
     refresh_threads: list[threading.Thread] = []
     cycle_thread: threading.Thread | None = None
-    review_state = AdaptiveReviewState()
 
     print(f"[CONFIG] DRY_RUN={settings.dry_run}, AUTO_REENTER={settings.auto_reenter_on_profit}", flush=True)
 
@@ -1226,17 +1123,6 @@ def run_telegram_bot() -> None:
                         print(f"[DEBUG] Received command: {text.strip().lower()}", flush=True)
                         normalized_text = text.strip().lower()
 
-                        if normalized_text.startswith("/review"):
-                            if review_state.is_pending():
-                                # Forward user's choice to the waiting cycle thread
-                                parts_r = text.strip().split(None, 1)
-                                choice = parts_r[1].strip().lower() if len(parts_r) >= 2 else "yes"
-                                review_state.respond(choice)
-                                _send_message(token, chat_id, f"✅ Đã ghi nhận lựa chọn: '{choice}'. Đang thực hiện...")
-                            else:
-                                _send_message(token, chat_id, "Không có adaptive review đang chờ phản hồi.")
-                            continue
-
                         if normalized_text.startswith("/trade"):
                             parts = text.strip().split()
                             target_usdt = settings.profit_reenter_usdt
@@ -1263,12 +1149,12 @@ def run_telegram_bot() -> None:
                                     "Đang khởi động multi-coin cycle: chọn coin theo số dư, "
                                     f"report PnL mỗi {settings.pnl_refresh_sec}s, "
                                     f"close all khi tổng pnl >= {target_usdt:.4f} USDT. "
-                                    f"Adaptive review sau {settings.adaptive_review_min} phút nếu PnL âm."
+                                    f"AI tự rotate coin nếu PnL âm sau {settings.adaptive_review_min} phút."
                                 ),
                             )
                             cycle_thread = threading.Thread(
                                 target=_run_multi_trade_cycle,
-                                args=(token, chat_id, stop_event, target_usdt, review_state),
+                                args=(token, chat_id, stop_event, target_usdt),
                                 daemon=True,
                             )
                             cycle_thread.start()
