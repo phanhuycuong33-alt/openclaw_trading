@@ -71,25 +71,49 @@ TOP_SAFE = ["changedetection.io", "n8n", "Ghost"]
 
 
 def get_mmo_report() -> str:
+    best = MMO_PROJECTS[0]
     lines = [
-        "MMO / self-hosted ideas (GitHub-based)",
-        "Lưu ý: không có repo nào 'chỉ chạy server là tự ra tiền'. Cần traffic, data hoặc khách hàng.",
-        "Top an toàn/thực tế: changedetection.io, n8n, Ghost.",
+        "MMO mode: bot tự chọn 1 hướng khả thi nhất",
+        "Tôi KHÔNG chọn kiểu click ads / survey farm vì thu nhập thấp, dễ khóa tài khoản, và dễ vi phạm nền tảng.",
         "",
+        f"Phương án được chọn: {best['name']}",
+        f"Repo: {best['repo']}",
+        f"Mô hình: {best['category']}",
+        f"Kiếm tiền: {best['how']}",
+        "",
+        "Vì sao chọn phương án này:",
+        "- Dễ chạy trên VPS nhỏ",
+        "- Có thể nối thẳng Telegram để bắn deal",
+        "- Có thể kiếm tiền qua affiliate hoặc nhóm premium",
+        "- Không cần hành vi rủi ro như click ads hay survey hàng loạt",
+        "",
+        "Quy trình A -> Z:",
+        "1) Chọn niche: điện thoại, laptop, tai nghe, gia dụng",
+        "2) Lấy affiliate link từ Shopee/Lazada/Tiki/Amazon nếu có",
+        "3) Cấu hình bot theo dõi URL giá / flash sale / coupon",
+        "4) Khi có deal tốt -> bắn Telegram ngay",
+        "5) Gắn affiliate link trong message",
+        "6) Tạo kênh Telegram hoặc nhóm deal riêng",
+        "7) Nếu traffic tốt -> mở nhóm VIP hoặc nhận sponsor",
+        "",
+        "Thông tin bạn chỉ cần cung cấp:",
+        "- Niche muốn làm",
+        "- Danh sách từ khóa hoặc URL sản phẩm muốn săn",
+        "- Telegram channel/group để bắn deal",
+        "- Affiliate link template nếu bạn có",
+        "",
+        "Tôi có thể làm tiếp cho bạn trong code:",
+        "- thêm /mmo start <niche>",
+        "- lưu keyword/URL theo dõi",
+        "- so sánh giá và tự bắn deal về Telegram",
+        "- format message có sẵn affiliate link",
+        "",
+        "Phương án phụ an toàn khác:",
     ]
 
-    for idx, item in enumerate(MMO_PROJECTS[:6], start=1):
-        top_mark = " [TOP]" if item["name"] in TOP_SAFE else ""
-        lines.append(f"{idx}) {item['name']}{top_mark}")
-        lines.append(f"   Repo: {item['repo']}")
-        lines.append(f"   Nhóm: {item['category']}")
-        lines.append(f"   Kiếm tiền: {item['how']}")
-        lines.append(f"   Budget: {item['budget']} | Độ khó: {item['difficulty']} | Risk: {item['risk']}")
-        lines.append(f"   Fit: {item['fit']}")
-        lines.append("")
+    for item in MMO_PROJECTS[1:4]:
+        lines.append(f"- {item['name']}: {item['category']} | {item['how']}")
 
-    lines.append("Gợi ý nhanh:")
-    lines.append("- Muốn dễ triển khai nhất: dùng changedetection.io để săn deal + Telegram + affiliate")
-    lines.append("- Muốn bán dịch vụ: dùng n8n hoặc Chatwoot")
-    lines.append("- Muốn bền vững: dùng Ghost + SEO + newsletter")
+    lines.append("")
+    lines.append("Kết luận: nếu muốn tôi làm từ A -> Z trong repo này, hướng tốt nhất là DEAL BOT + AFFILIATE, không phải ads/surveys.")
     return "\n".join(lines)
