@@ -69,6 +69,33 @@ MMO_PROJECTS: list[dict[str, Any]] = [
 
 TOP_SAFE = ["changedetection.io", "n8n", "Ghost"]
 
+AUTO_NICHE = {
+    "name": "AI tools + SaaS deals + hosting/VPS offers",
+    "why": (
+        "Phù hợp nhất khi bạn chạy trên Google server: sản phẩm số, không cần giao hàng, "
+        "dễ gắn affiliate, dễ theo dõi thay đổi giá/trial/coupon, và audience online rõ ràng."
+    ),
+    "keywords": [
+        "ai tool deal",
+        "lifetime deal ai",
+        "vps coupon",
+        "hosting deal",
+        "cloud credits",
+        "domain promo",
+        "proxy discount",
+        "seo tool discount",
+        "email marketing deal",
+        "chatbot discount",
+    ],
+    "sources": [
+        "pricing pages của SaaS",
+        "lifetime deal pages",
+        "hosting/VPS promo pages",
+        "domain registrar promo pages",
+        "AppSumo / deal blogs / launch pages",
+    ],
+}
+
 
 def get_mmo_report() -> str:
     best = MMO_PROJECTS[0]
@@ -87,29 +114,54 @@ def get_mmo_report() -> str:
         "- Có thể kiếm tiền qua affiliate hoặc nhóm premium",
         "- Không cần hành vi rủi ro như click ads hay survey hàng loạt",
         "",
+        f"Niche bot tự chọn: {AUTO_NICHE['name']}",
+        f"Lý do: {AUTO_NICHE['why']}",
+        "",
+        "Keyword bot tự chọn:",
+    ]
+
+    for keyword in AUTO_NICHE["keywords"]:
+        lines.append(f"- {keyword}")
+
+    lines.extend([
+        "",
+        "Nguồn nên theo dõi:",
+    ])
+
+    for source in AUTO_NICHE["sources"]:
+        lines.append(f"- {source}")
+
+    lines.extend([
+        "",
         "Quy trình A -> Z:",
-        "1) Chọn niche: điện thoại, laptop, tai nghe, gia dụng",
-        "2) Lấy affiliate link từ Shopee/Lazada/Tiki/Amazon nếu có",
-        "3) Cấu hình bot theo dõi URL giá / flash sale / coupon",
+        "1) Dùng niche bot đã chọn: AI tools + SaaS + hosting/VPS",
+        "2) Lấy affiliate link từ AppSumo/Amazon/SaaS partner/hosting referral nếu có",
+        "3) Cấu hình bot theo dõi URL giá / coupon / lifetime deal / trial page",
         "4) Khi có deal tốt -> bắn Telegram ngay",
         "5) Gắn affiliate link trong message",
-        "6) Tạo kênh Telegram hoặc nhóm deal riêng",
+        "6) Tạo kênh Telegram hoặc channel niche riêng",
         "7) Nếu traffic tốt -> mở nhóm VIP hoặc nhận sponsor",
         "",
         "Thông tin bạn chỉ cần cung cấp:",
-        "- Niche muốn làm",
-        "- Danh sách từ khóa hoặc URL sản phẩm muốn săn",
         "- Telegram channel/group để bắn deal",
         "- Affiliate link template nếu bạn có",
+        "- Nếu muốn: thêm vài URL cụ thể cần theo dõi",
+        "",
+        "Thông tin bot đã tự chọn sẵn:",
+        "- niche",
+        "- keyword ưu tiên",
+        "- hướng monetization",
+        "- nguồn deal phù hợp server",
+        "- Telegram channel/group để bắn deal",
         "",
         "Tôi có thể làm tiếp cho bạn trong code:",
-        "- thêm /mmo start <niche>",
-        "- lưu keyword/URL theo dõi",
+        "- thêm /mmo start để bot tự dùng niche này luôn",
+        "- lưu keyword/URL theo dõi mặc định",
         "- so sánh giá và tự bắn deal về Telegram",
         "- format message có sẵn affiliate link",
         "",
         "Phương án phụ an toàn khác:",
-    ]
+    ])
 
     for item in MMO_PROJECTS[1:4]:
         lines.append(f"- {item['name']}: {item['category']} | {item['how']}")
