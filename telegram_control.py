@@ -88,6 +88,11 @@ def _format_trade_message(output: dict[str, Any]) -> str:
         f"{usage['used_pct']}% ({usage['used']}/{usage['limit']})"
     )
 
+    execution = output.get("execution", {})
+    warnings = execution.get("warnings", []) if isinstance(execution, dict) else []
+    if warnings:
+        lines.append("Execution warning: " + " | ".join(str(item) for item in warnings))
+
     return "\n".join(lines)
 
 
@@ -183,7 +188,10 @@ def _build_cycle_trades() -> dict[str, Any]:
             dry_run=True,
         )
 
-    trade_slots = _select_trade_slots(available_balance if available_balance > 0 else 5.0, settings.max_trade_candidates)
+    effective_balance = available_balance if available_balance > 0 else 5.0
+    reserve_balance = 1.0 if effective_balance > 1.5 else 0.0
+    remaining_budget = max(0.0, effective_balance - reserve_balance)
+    trade_slots = _select_trade_slots(effective_balance, settings.max_trade_candidates)
 
     trending = fetch_trending()
     trending_ids = {coin["id"] for coin in trending if coin.get("id")}
@@ -192,12 +200,13 @@ def _build_cycle_trades() -> dict[str, Any]:
     if not ranked:
         raise RuntimeError("Không có dữ liệu thị trường để chọn coin")
 
-    candidates = _pick_supported_candidates(ranked, trader, trade_slots)
+    candidates = _pick_supported_candidates(ranked, trader, settings.max_trade_candidates)
     if not candidates:
         raise RuntimeError("Không tìm thấy coin futures phù hợp")
 
     attempts: list[dict[str, Any]] = []
     active_trades: list[dict[str, Any]] = []
+    budget_used = 0.0
 
     for coin, symbol in candidates:
         side = choose_side(coin)
@@ -210,19 +219,40 @@ def _build_cycle_trades() -> dict[str, Any]:
         )
 
         try:
+            required_margin = trader.get_min_trade_margin(
+                symbol=symbol,
+                leverage=settings.leverage,
+                base_usdt_amount=1.0,
+            )
+            if required_margin > remaining_budget:
+                attempts.append(
+                    {
+                        "symbol": symbol,
+                        "status": "skipped_budget",
+                        "error": (
+                            f"Không đủ budget còn lại {remaining_budget:.4f} USDT, "
+                            f"cần khoảng {required_margin:.4f} USDT"
+                        ),
+                    }
+                )
+                continue
+
             plan = trader.build_trade_plan(
                 symbol=symbol,
                 side=side,
-                usdt_amount=1.0,
+                usdt_amount=required_margin,
                 leverage=settings.leverage,
                 take_profit=tp_price,
                 stop_loss=sl_price,
             )
             execution = trader.execute_trade(plan)
+            remaining_budget = max(0.0, remaining_budget - required_margin)
+            budget_used += required_margin
             active_trades.append(
                 {
                     "coin": coin,
                     "symbol": symbol,
+                    "allocated_margin": round(required_margin, 6),
                     "trade_plan": {
                         "symbol": plan.symbol,
                         "side": plan.side,
@@ -237,14 +267,43 @@ def _build_cycle_trades() -> dict[str, Any]:
                 }
             )
             attempts.append({"symbol": symbol, "status": "success"})
+            if len(active_trades) >= trade_slots:
+                break
         except Exception as exc:
             attempts.append({"symbol": symbol, "status": "failed", "error": str(exc)})
 
     if not active_trades:
-        raise RuntimeError("Không mở được lệnh nào trong batch")
+        sample_errors = "; ".join(
+            f"{item.get('symbol')}: {item.get('error')}"
+            for item in attempts[:5]
+            if item.get("status") in {"failed", "skipped_budget"}
+        )
+        open_positions_text = ""
+        if not effective_dry_run:
+            try:
+                open_positions = trader.get_open_positions()
+                if open_positions:
+                    preview = ", ".join(
+                        f"{pos.get('symbol')}({float(pos.get('position_amt') or 0.0):.6f})"
+                        for pos in open_positions[:5]
+                    )
+                    open_positions_text = (
+                        " Phát hiện vị thế đang mở trên Binance: "
+                        f"{preview}."
+                    )
+            except Exception:
+                pass
+        raise RuntimeError(
+            f"Không mở được lệnh nào trong batch. Balance khả dụng hiện tại: {available_balance:.4f} USDT. "
+            f"Một số lỗi: {sample_errors or 'không có chi tiết'}.{open_positions_text}"
+        )
 
     return {
         "available_balance": available_balance,
+        "effective_balance": effective_balance,
+        "reserve_balance": reserve_balance,
+        "remaining_budget": remaining_budget,
+        "budget_used": budget_used,
         "fallback_reason": fallback_reason,
         "trade_slots": trade_slots,
         "active_trades": active_trades,
@@ -333,6 +392,9 @@ def _run_multi_trade_cycle(
         active_trades = batch.get("active_trades", [])
         fallback_reason = str(batch.get("fallback_reason") or "")
         available_balance = float(batch.get("available_balance") or 0.0)
+        budget_used = float(batch.get("budget_used") or 0.0)
+        reserve_balance = float(batch.get("reserve_balance") or 0.0)
+        remaining_budget = float(batch.get("remaining_budget") or 0.0)
 
         mode = "PAPER"
         if active_trades:
@@ -345,6 +407,7 @@ def _run_multi_trade_cycle(
         header_lines = [
             f"Batch {cycle_index} started | Mode: {mode}",
             f"Balance: {available_balance:.4f} USDT | Opened: {len(active_trades)} lệnh | Coins: {symbols_text}",
+            f"Budget used: {budget_used:.4f} | Reserve: {reserve_balance:.4f} | Remaining: {remaining_budget:.4f}",
             f"Close condition: tổng pnl >= {close_target_usdt:.4f} USDT",
         ]
         if fallback_reason:

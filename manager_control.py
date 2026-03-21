@@ -11,6 +11,8 @@ from typing import Any
 import requests
 from dotenv import load_dotenv
 
+from src.binance_trader import BinanceFuturesTrader
+
 
 load_dotenv()
 
@@ -48,6 +50,25 @@ class OpenClawManager:
 
         if not self.token:
             raise RuntimeError("Thiếu TELEGRAM_BOT_TOKEN trong .env")
+
+    def _close_all_positions(self) -> str:
+        api_key = os.getenv("BINANCE_API_KEY", "").strip()
+        api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
+        if not api_key or not api_secret:
+            return "Không close được vị thế: thiếu BINANCE_API_KEY/BINANCE_API_SECRET."
+
+        try:
+            trader = BinanceFuturesTrader(api_key=api_key, api_secret=api_secret, dry_run=False)
+            result = trader.close_all_open_positions()
+            closed = int(result.get("closed") or 0)
+            requested = int(result.get("requested") or 0)
+            errors = result.get("errors") or []
+            message = f"Close all positions: đóng {closed}/{requested} vị thế."
+            if errors:
+                message += " Lỗi: " + "; ".join(str(item) for item in errors)
+            return message
+        except Exception as exc:
+            return f"Close all positions thất bại: {exc}"
 
     def _is_child_running(self) -> bool:
         return self.child_proc is not None and self.child_proc.poll() is None
@@ -122,12 +143,15 @@ class OpenClawManager:
             return self._start_child(), False
 
         if command == "/stop":
-            return self._stop_child(), False
+            close_msg = self._close_all_positions()
+            stop_msg = self._stop_child()
+            return f"{close_msg}\n{stop_msg}", False
 
         if command == "/stop force":
+            close_msg = self._close_all_positions()
             stop_msg = self._stop_child()
             self.running = False
-            return f"{stop_msg}\nManager sẽ dừng ngay.", True
+            return f"{close_msg}\n{stop_msg}\nManager sẽ dừng ngay.", True
 
         if command == "/status":
             state = "RUNNING" if self._is_child_running() else "STOPPED"

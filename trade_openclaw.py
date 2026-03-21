@@ -143,7 +143,15 @@ def run_trading() -> dict[str, Any]:
             continue
 
     if plan is None or result is None or candidate is None or symbol is None:
-        raise RuntimeError(f"Thử {len(attempts)} coin nhưng đều thất bại khi đặt lệnh")
+        sample_errors = "; ".join(
+            f"{item.get('symbol')}: {item.get('error')}"
+            for item in attempts[:5]
+            if item.get("status") == "failed"
+        )
+        raise RuntimeError(
+            f"Thử {len(attempts)} coin nhưng đều thất bại khi đặt lệnh. "
+            f"Một số lỗi: {sample_errors or 'không có chi tiết'}"
+        )
 
     output = {
         "candidate": candidate,
