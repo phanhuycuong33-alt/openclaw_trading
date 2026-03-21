@@ -13,6 +13,7 @@ from src.analyzer import score_coins
 from src.config import load_settings
 from src.binance_trader import BinanceFuturesTrader
 from src.claude_client import review_positions_with_claude
+from src.ecommerce_scanner import run_sell_scan
 from src.trading_strategy import choose_side, compute_tp_sl
 from src.usage_tracker import get_copilot_usage
 from src.web_fetcher import fetch_markets, fetch_trending
@@ -572,6 +573,32 @@ def _format_trade_message(output: dict[str, Any]) -> str:
     warnings = execution.get("warnings", []) if isinstance(execution, dict) else []
     if warnings:
         lines.append("Execution warning: " + " | ".join(str(item) for item in warnings))
+
+    return "\n".join(lines)
+
+
+def _format_sell_report(output: dict[str, Any]) -> str:
+    keywords = output.get("keywords", [])
+    opportunities = output.get("opportunities", [])
+
+    lines = [
+        "OpenClaw Sell Scan Result",
+        f"Keywords: {', '.join(str(k) for k in keywords) if keywords else 'N/A'}",
+        f"Deals found: {len(opportunities)}",
+    ]
+
+    if not opportunities:
+        lines.append("Không tìm thấy sản phẩm có chênh lệch giá đủ lớn.")
+        return "\n".join(lines)
+
+    for idx, item in enumerate(opportunities[:5], start=1):
+        lines.append(
+            (
+                f"{idx}) {item.get('title')} | {item.get('brand')} | ${float(item.get('price') or 0.0):.2f} "
+                f"vs baseline ${float(item.get('baseline_price') or 0.0):.2f} "
+                f"(gap {float(item.get('gap_pct') or 0.0):.1f}%)"
+            )
+        )
 
     return "\n".join(lines)
 
@@ -1279,6 +1306,7 @@ def _handle_command(text: str) -> tuple[str, bool, dict[str, Any] | None, bool]:
         return (
             "Commands:\n"
             "/trade hoặc /trade <target_usdt> [review_after_sec] [leverage] (multi-coin cycle)\n"
+            "/sell hoặc /sell <keyword1,keyword2> (scan sản phẩm e-commerce)\n"
             "/run openclaw trading (single trade)\n"
             "/status\n/aiusage\n/stop"
         ), False, None, False
@@ -1303,10 +1331,19 @@ def _handle_command(text: str) -> tuple[str, bool, dict[str, Any] | None, bool]:
         output = run_trading()
         return _format_trade_message(output), True, output, False
 
+    if command.startswith("/sell"):
+        raw_text = text.strip()
+        parts = raw_text.split(maxsplit=1)
+        keywords: list[str] | None = None
+        if len(parts) == 2 and parts[1].strip():
+            keywords = [kw.strip() for kw in parts[1].split(",") if kw.strip()]
+        output = run_sell_scan(keywords=keywords)
+        return _format_sell_report(output), False, output, False
+
     if command == "/trade":
         return "Đang khởi động chế độ multi-coin cycle...", False, None, False
 
-    return "Lệnh không hợp lệ. Dùng /run openclaw trading hoặc /trade", False, None, False
+    return "Lệnh không hợp lệ. Dùng /trade, /sell hoặc /run openclaw trading", False, None, False
 
 
 def run_telegram_bot() -> None:
@@ -1460,6 +1497,9 @@ def run_telegram_bot() -> None:
 
                         if text.strip().lower() == "/run openclaw trading":
                             _send_message(token, chat_id, "Đang làm việc... quét thị trường, chọn coin và chuẩn bị lệnh.")
+
+                        if text.strip().lower().startswith("/sell"):
+                            _send_message(token, chat_id, "Đang quét sàn TMĐT và tìm chênh lệch giá...")
 
                         reply, should_refresh_pnl, output, should_stop = _handle_command(text)
                         print(f"[DEBUG] Command processed, should_refresh_pnl={should_refresh_pnl}, should_stop={should_stop}", flush=True)
