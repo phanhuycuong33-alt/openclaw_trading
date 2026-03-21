@@ -88,6 +88,11 @@ def _estimate_close_fee(qty: float, mark_price: float, fee_rate: float) -> float
     return abs(qty) * mark_price * fee_rate
 
 
+def _estimate_open_fee(qty: float, entry_price: float, fee_rate: float) -> float:
+    """One-side taker fee for opening a position."""
+    return abs(qty) * entry_price * fee_rate
+
+
 def _choose_adaptive_leverage(coin_data: dict[str, Any], settings: Any) -> int:
     base_leverage = max(1, int(settings.leverage))
     score = float(coin_data.get("pump_probability_score") or 0.0)
@@ -201,9 +206,12 @@ def _build_adaptive_review_recommendations(
             else:
                 current_pnl = (entry_price - mark_price) * qty
 
-        notional = mark_price * qty if mark_price > 0 else entry_price * qty
-        close_fee_est = _estimate_close_fee(qty, mark_price if mark_price > 0 else entry_price, fee_rate)
-        net_pnl_if_close = current_pnl - close_fee_est
+        effective_mark_price = mark_price if mark_price > 0 else entry_price
+        notional = effective_mark_price * qty
+        entry_fee_est = _estimate_open_fee(qty, entry_price, fee_rate)
+        close_fee_est = _estimate_close_fee(qty, effective_mark_price, fee_rate)
+        total_trade_fee_est = entry_fee_est + close_fee_est
+        net_pnl_if_close = current_pnl - total_trade_fee_est
 
         # Re-score coin in fresh market
         fresh_coin = fresh_by_symbol.get(symbol)
@@ -212,6 +220,7 @@ def _build_adaptive_review_recommendations(
         # Find best outside replacement candidate (higher fresh score, supports futures)
         replacement_symbol: str | None = None
         replacement_score: float = 0.0
+        replacement_open_fee_est: float = 0.0
         for cand in fresh_ranked:
             cand_sym = f"{str(cand.get('symbol', '')).upper()}USDT"
             if cand_sym in active_symbols:
@@ -222,6 +231,7 @@ def _build_adaptive_review_recommendations(
                     if price_trader.supports_symbol(cand_sym):
                         replacement_symbol = cand_sym
                         replacement_score = cand_score
+                        replacement_open_fee_est = notional * fee_rate
                 except Exception:
                     pass
             if replacement_symbol and replacement_score > fresh_score * 1.2:
@@ -230,23 +240,26 @@ def _build_adaptive_review_recommendations(
         # Decision logic
         if current_pnl >= 0:
             # Positive PnL
-            if net_pnl_if_close > 0 and replacement_symbol:
+            net_pnl_if_rotate = net_pnl_if_close - replacement_open_fee_est
+            if net_pnl_if_rotate > 0 and replacement_symbol:
                 action = "CLOSE_REPLACE"
                 reason = (
                     f"PnL dương +{current_pnl:.4f} USDT. "
-                    f"Sau phí close ≈ {close_fee_est:.4f}, net = +{net_pnl_if_close:.4f}. "
+                    f"Sau phí vào+ra ≈ {total_trade_fee_est:.4f}, net close = {net_pnl_if_close:+.4f}. "
+                    f"Nếu xoay sang coin mới, phí mở thêm ≈ {replacement_open_fee_est:.4f}, net rotate = {net_pnl_if_rotate:+.4f}. "
                     f"Có coin thay thế {replacement_symbol} score {replacement_score:.3f} > {fresh_score:.3f}."
                 )
             elif net_pnl_if_close <= 0:
                 action = "HOLD"
                 reason = (
-                    f"PnL +{current_pnl:.4f} USDT nhưng phí close ≈ {close_fee_est:.4f} sẽ ăn hết lợi nhuận "
+                    f"PnL +{current_pnl:.4f} USDT nhưng phí vào+ra ≈ {total_trade_fee_est:.4f} sẽ ăn hết lợi nhuận "
                     f"(net {net_pnl_if_close:.4f}). Tiếp tục giữ."
                 )
             else:
                 action = "HOLD"
                 reason = (
-                    f"PnL +{current_pnl:.4f} USDT. Không tìm được coin thay thế tốt hơn đáng kể. Tiếp tục giữ."
+                    f"PnL +{current_pnl:.4f} USDT. Net sau phí vào+ra còn {net_pnl_if_close:+.4f}. "
+                    f"Không có phương án thay coin đủ tốt sau khi tính phí. Tiếp tục giữ."
                 )
         else:
             # Negative PnL (loss)
@@ -258,14 +271,15 @@ def _build_adaptive_review_recommendations(
                 reason = (
                     f"PnL lỗ {current_pnl:.4f} USDT. "
                     f"Score thị trường của coin yếu ({fresh_score:.3f}). "
-                    f"Coin thay thế {replacement_symbol} score {replacement_score:.3f} tốt hơn đáng kể."
+                    f"Coin thay thế {replacement_symbol} score {replacement_score:.3f} tốt hơn đáng kể. "
+                    f"Net close sau phí vào+ra hiện tại ≈ {net_pnl_if_close:+.4f}."
                 )
             elif score_dropped:
                 action = "CLOSE_CUT_LOSS"
                 reason = (
                     f"PnL lỗ {current_pnl:.4f} USDT. "
                     f"Score thị trường của coin đã yếu ({fresh_score:.3f}). "
-                    f"Cắt lỗ, không tìm được coin thay thế tốt."
+                    f"Cắt lỗ, không tìm được coin thay thế tốt. Net close sau phí vào+ra ≈ {net_pnl_if_close:+.4f}."
                 )
             else:
                 action = "HOLD"
@@ -284,8 +298,11 @@ def _build_adaptive_review_recommendations(
                 "mark_price": mark_price if mark_price > 0 else entry_price,
                 "notional": notional,
                 "current_pnl": current_pnl,
+                "entry_fee_est": entry_fee_est,
                 "close_fee_est": close_fee_est,
+                "total_trade_fee_est": total_trade_fee_est,
                 "net_pnl_if_close": net_pnl_if_close,
+                "replacement_open_fee_est": replacement_open_fee_est,
                 "fresh_score": fresh_score,
                 "action": action,
                 "reason": reason,
