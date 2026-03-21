@@ -169,3 +169,106 @@ def get_mmo_report() -> str:
     lines.append("")
     lines.append("Kết luận: nếu muốn tôi làm từ A -> Z trong repo này, hướng tốt nhất là DEAL BOT + AFFILIATE, không phải ads/surveys.")
     return "\n".join(lines)
+
+
+def get_mmo_steps_report() -> str:
+    lines = [
+        "MMO Telegram steps (thực chiến)",
+        "1) Mở manager bot và gọi /start",
+        "2) Từ manager gọi lệnh mở bot con OpenClaw (theo flow manager hiện tại)",
+        "3) Vào đúng khung chat của bot con OpenClaw",
+        "4) Gõ /mmo start",
+        "5) Sau đó gõ /mmo để xem niche+keyword auto đã chọn",
+        "6) Mỗi ngày kiểm tra /mmo status để theo dõi conversion/payout checklist",
+        "",
+        "Lệnh MMO dùng trong bot con:",
+        "- /mmo          : xem chiến lược bot auto chọn",
+        "- /mmo start    : nhận checklist khởi động A->Z",
+        "- /mmo steps    : xem lại hướng dẫn thao tác Telegram",
+        "- /mmo status   : checklist kiểm tra tiền về",
+        "- /mmo withdraw : hướng dẫn rút tiền",
+    ]
+    return "\n".join(lines)
+
+
+def get_mmo_start_report() -> str:
+    lines = [
+        "MMO start checklist",
+        "Niche đã chọn tự động: AI tools + SaaS + hosting/VPS deals",
+        "Keyword đã nạp tự động: ai tool deal, lifetime deal ai, vps coupon, hosting deal, cloud credits...",
+        "",
+        "Việc cần làm ngay (5-10 phút):",
+        "1) Xác nhận Telegram chat/channel nhận alert",
+        "2) Ghim message mô tả kênh deal để giữ user",
+        "3) Chuẩn bị affiliate link (nếu có) hoặc chạy non-affiliate trước",
+        "4) Lưu danh sách 10-20 URL pricing/coupon/lifetime deal",
+        "5) Theo dõi click/conversion mỗi ngày",
+        "",
+        "Mục tiêu tuần đầu:",
+        "- Có deal alert đều đặn",
+        "- Có click ổn định",
+        "- Có conversion đầu tiên",
+    ]
+    return "\n".join(lines)
+
+
+def get_mmo_status_report() -> str:
+    lines = [
+        "MMO status checklist (kiểm tra tiền)",
+        "Mở dashboard affiliate và ghi nhận mỗi ngày:",
+        "- Clicks",
+        "- Conversions",
+        "- Pending commission",
+        "- Approved commission",
+        "- Paid",
+        "",
+        "Điều kiện có tiền về:",
+        "- Có conversion hợp lệ",
+        "- Hết thời gian hold/duyệt đơn",
+        "- Đạt ngưỡng payout tối thiểu",
+        "",
+        "Nếu chưa có tiền sau vài ngày:",
+        "- Tăng số URL theo dõi",
+        "- Tăng chất lượng deal alert",
+        "- Tăng tần suất post Telegram",
+    ]
+    return "\n".join(lines)
+
+
+def get_mmo_withdraw_report() -> str:
+    lines = [
+        "MMO withdraw guide",
+        "1) Vào mục Payout/Billing của affiliate network",
+        "2) Kết nối phương thức nhận tiền (bank/PayPal/Payoneer/crypto)",
+        "3) Kiểm tra số dư Approved (không phải Pending)",
+        "4) Kiểm tra ngưỡng rút tối thiểu",
+        "5) Bấm Withdraw hoặc chờ auto payout theo kỳ",
+        "",
+        "Lưu ý:",
+        "- Bot không giữ tiền",
+        "- Tiền nằm ở tài khoản affiliate network của bạn",
+    ]
+    return "\n".join(lines)
+
+
+def handle_mmo_command(raw_text: str) -> str:
+    text = raw_text.strip().lower()
+    if text in {"/mmo", "/mmo info"}:
+        return get_mmo_report()
+    if text == "/mmo steps":
+        return get_mmo_steps_report()
+    if text == "/mmo start":
+        return get_mmo_start_report()
+    if text == "/mmo status":
+        return get_mmo_status_report()
+    if text == "/mmo withdraw":
+        return get_mmo_withdraw_report()
+
+    return (
+        "MMO command không hợp lệ. Dùng:\n"
+        "/mmo\n"
+        "/mmo start\n"
+        "/mmo steps\n"
+        "/mmo status\n"
+        "/mmo withdraw"
+    )

@@ -14,7 +14,7 @@ from src.config import load_settings
 from src.binance_trader import BinanceFuturesTrader
 from src.claude_client import review_positions_with_claude
 from src.ecommerce_scanner import run_sell_scan
-from src.mmo_research import get_mmo_report
+from src.mmo_research import handle_mmo_command
 from src.second_advisor import rerank_with_second_advisor
 from src.trading_strategy import choose_side, compute_tp_sl
 from src.usage_tracker import get_copilot_usage
@@ -1310,7 +1310,7 @@ def _handle_command(text: str) -> tuple[str, bool, dict[str, Any] | None, bool]:
             "Commands:\n"
             "/trade hoặc /trade <target_usdt> [review_after_sec] [leverage] (multi-coin cycle)\n"
             "/sell hoặc /sell <keyword1,keyword2> (scan sản phẩm e-commerce)\n"
-            "/mmo (gợi ý repo GitHub/self-hosted để kiếm tiền online)\n"
+            "/mmo | /mmo start | /mmo steps | /mmo status | /mmo withdraw\n"
             "/run openclaw trading (single trade)\n"
             "/status\n/aiusage\n/stop"
         ), False, None, False
@@ -1344,8 +1344,8 @@ def _handle_command(text: str) -> tuple[str, bool, dict[str, Any] | None, bool]:
         output = run_sell_scan(keywords=keywords)
         return _format_sell_report(output), False, output, False
 
-    if command == "/mmo":
-        return get_mmo_report(), False, None, False
+    if command.startswith("/mmo"):
+        return handle_mmo_command(text), False, None, False
 
     if command == "/trade":
         return "Đang khởi động chế độ multi-coin cycle...", False, None, False
