@@ -9,6 +9,10 @@ from typing import Any
 USAGE_FILE = Path("usage_stats.json")
 
 
+class CopilotQuotaExceededError(RuntimeError):
+    pass
+
+
 def _today_key() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d")
 
@@ -30,6 +34,9 @@ def increment_copilot_queries(limit: int) -> dict[str, Any]:
     stats = _read_stats()
     day = _today_key()
     daily = stats.get(day, {})
+    current_used = int(daily.get("copilot_queries", 0))
+    if limit > 0 and current_used >= limit:
+        raise CopilotQuotaExceededError("Copilot hết token/quota (ước lượng local tracker).")
     used = int(daily.get("copilot_queries", 0)) + 1
     daily["copilot_queries"] = used
     stats[day] = daily

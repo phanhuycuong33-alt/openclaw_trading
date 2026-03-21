@@ -50,6 +50,34 @@ class BinanceFuturesTrader:
             return 0.0
         return float(positions[0].get("positionAmt") or 0.0)
 
+    def get_position_snapshot(self, symbol: str) -> dict[str, Any]:
+        positions = self.client.futures_position_information(symbol=symbol.upper())
+        if not positions:
+            return {
+                "symbol": symbol.upper(),
+                "position_amt": 0.0,
+                "entry_price": 0.0,
+                "mark_price": 0.0,
+                "unrealized_pnl": 0.0,
+                "side": "FLAT",
+            }
+
+        item = positions[0]
+        position_amt = float(item.get("positionAmt") or 0.0)
+        entry_price = float(item.get("entryPrice") or 0.0)
+        mark_price = float(item.get("markPrice") or 0.0)
+        unrealized_pnl = float(item.get("unRealizedProfit") or 0.0)
+        side = "LONG" if position_amt > 0 else ("SHORT" if position_amt < 0 else "FLAT")
+
+        return {
+            "symbol": symbol.upper(),
+            "position_amt": position_amt,
+            "entry_price": entry_price,
+            "mark_price": mark_price,
+            "unrealized_pnl": unrealized_pnl,
+            "side": side,
+        }
+
     def close_position_market(self, symbol: str) -> dict[str, Any] | None:
         position_amt = self.get_position_amount(symbol)
         if position_amt == 0:

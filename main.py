@@ -7,7 +7,7 @@ from src.analyzer import score_coins
 from src.claude_client import summarize_with_claude
 from src.copilot_prompt import build_copilot_prompt
 from src.config import load_settings
-from src.usage_tracker import increment_copilot_queries
+from src.usage_tracker import CopilotQuotaExceededError, increment_copilot_queries
 from src.web_fetcher import fetch_markets, fetch_trending
 
 
@@ -47,9 +47,14 @@ def run() -> None:
 
     copilot_prompt = build_copilot_prompt(top_ranked)
     prompt_path.write_text(copilot_prompt, encoding="utf-8")
-    usage = increment_copilot_queries(settings.copilot_daily_query_limit)
     print("\n=== Copilot Mode ===")
     print(f"Đã tạo prompt cho Copilot tại: {prompt_path}")
+    try:
+        usage = increment_copilot_queries(settings.copilot_daily_query_limit)
+    except CopilotQuotaExceededError as exc:
+        print(f"Lỗi: {exc}")
+        print("Gợi ý: Copilot có thể đã hết token/request quota. Hãy chờ reset quota hoặc tăng COPILOT_DAILY_QUERY_LIMIT nếu chỉ muốn bỏ qua local tracker.")
+        raise SystemExit(1)
     print(
         "Copilot usage (estimate): "
         f"{usage['used']}/{usage['limit']} ({usage['used_pct']}%)"

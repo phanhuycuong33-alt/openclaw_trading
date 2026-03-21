@@ -10,15 +10,25 @@ fi
 source .venv/bin/activate
 pip install -r requirements.txt >/dev/null
 
-app="${1:-openclaw}"
-action="${2:-analysis}"
+first="${1:-openclaw}"
+second="${2:-analysis}"
 
-if [[ "$app" != "openclaw" ]]; then
+if [[ "$first" == "manager" ]]; then
+  if [[ "$second" != "openclaw" ]]; then
+    echo "Usage: ./run manager openclaw"
+    exit 1
+  fi
+  exec python manager_control.py
+fi
+
+if [[ "$first" != "openclaw" ]]; then
   echo "Usage: ./run openclaw [analysis|trading|telegram]"
+  echo "       ./run manager openclaw"
+  echo "Manager env (optional): MANAGER_TELEGRAM_BOT_TOKEN, OPENCLAW_TELEGRAM_BOT_TOKEN"
   exit 1
 fi
 
-case "$action" in
+case "$second" in
   analysis)
     exec python main.py
     ;;
@@ -30,6 +40,8 @@ case "$action" in
     ;;
   *)
     echo "Usage: ./run openclaw [analysis|trading|telegram]"
+    echo "       ./run manager openclaw"
+    echo "Manager env (optional): MANAGER_TELEGRAM_BOT_TOKEN, OPENCLAW_TELEGRAM_BOT_TOKEN"
     exit 1
     ;;
 esac
