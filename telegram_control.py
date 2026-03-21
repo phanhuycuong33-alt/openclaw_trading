@@ -14,7 +14,14 @@ from src.config import load_settings
 from src.binance_trader import BinanceFuturesTrader
 from src.claude_client import review_positions_with_claude
 from src.ecommerce_scanner import run_sell_scan
-from src.mmo_research import handle_mmo_command
+from src.mmo_research import (
+    fetch_affiliate_payout_status,
+    format_mmo_auto_alert,
+    get_mmo_auto_keywords,
+    get_mmo_auto_scan_interval_sec,
+    get_mmo_min_gap_pct,
+    handle_mmo_command,
+)
 from src.second_advisor import rerank_with_second_advisor
 from src.trading_strategy import choose_side, compute_tp_sl
 from src.usage_tracker import get_copilot_usage
@@ -1302,6 +1309,73 @@ def _refresh_pnl(token: str, chat_id: str, output: dict[str, Any], stop_event: t
             )
 
 
+def _run_mmo_auto_loop(token: str, chat_id: str, stop_event: threading.Event) -> None:
+    keywords = get_mmo_auto_keywords()
+    scan_interval_sec = get_mmo_auto_scan_interval_sec()
+    min_gap_pct = get_mmo_min_gap_pct()
+    last_top_signature = ""
+    last_approved_balance: float | None = None
+
+    _send_message(
+        token,
+        chat_id,
+        (
+            "MMO auto đã bật. "
+            f"Scan mỗi {scan_interval_sec}s | min gap {min_gap_pct:.1f}% | keywords={len(keywords)}"
+        ),
+    )
+
+    while not stop_event.is_set():
+        try:
+            output = run_sell_scan(
+                keywords=keywords,
+                limit_per_keyword=20,
+                min_gap_pct=min_gap_pct,
+            )
+            opportunities = output.get("opportunities", []) if isinstance(output, dict) else []
+
+            signature_parts: list[str] = []
+            for item in opportunities[:3]:
+                signature_parts.append(
+                    f"{item.get('title')}|{float(item.get('price') or 0.0):.2f}|{float(item.get('gap_pct') or 0.0):.1f}"
+                )
+            signature = "||".join(signature_parts)
+
+            if signature and signature != last_top_signature:
+                _send_message(token, chat_id, format_mmo_auto_alert(output))
+                last_top_signature = signature
+
+            payout = fetch_affiliate_payout_status()
+            if payout is not None:
+                approved = float(payout.get("approved_balance") or 0.0)
+                currency = str(payout.get("currency") or "USD")
+                min_withdraw = float(payout.get("min_withdraw") or 0.0)
+
+                if last_approved_balance is None:
+                    last_approved_balance = approved
+                elif approved > last_approved_balance:
+                    delta = approved - last_approved_balance
+                    _send_message(
+                        token,
+                        chat_id,
+                        (
+                            f"💰 MMO payout update: approved tăng +{delta:.2f} {currency} "
+                            f"(current {approved:.2f} {currency}). "
+                            f"Ngưỡng rút: {min_withdraw:.2f} {currency}. Dùng /mmo withdraw để xem hướng dẫn rút."
+                        ),
+                    )
+                    last_approved_balance = approved
+        except Exception as exc:
+            _send_message(token, chat_id, f"MMO auto loop lỗi: {exc}")
+
+        remaining = scan_interval_sec
+        while remaining > 0 and not stop_event.is_set():
+            time.sleep(1)
+            remaining -= 1
+
+    _send_message(token, chat_id, "MMO auto đã dừng.")
+
+
 def _handle_command(text: str) -> tuple[str, bool, dict[str, Any] | None, bool]:
     command = text.strip().lower()
 
@@ -1310,7 +1384,7 @@ def _handle_command(text: str) -> tuple[str, bool, dict[str, Any] | None, bool]:
             "Commands:\n"
             "/trade hoặc /trade <target_usdt> [review_after_sec] [leverage] (multi-coin cycle)\n"
             "/sell hoặc /sell <keyword1,keyword2> (scan sản phẩm e-commerce)\n"
-            "/mmo | /mmo start | /mmo steps | /mmo status | /mmo withdraw\n"
+            "/mmo | /mmo auto | /mmo stop | /mmo start | /mmo steps | /mmo status | /mmo withdraw\n"
             "/run openclaw trading (single trade)\n"
             "/status\n/aiusage\n/stop"
         ), False, None, False
@@ -1367,6 +1441,8 @@ def run_telegram_bot() -> None:
     stop_event = threading.Event()
     refresh_threads: list[threading.Thread] = []
     cycle_thread: threading.Thread | None = None
+    mmo_auto_stop_event = threading.Event()
+    mmo_auto_thread: threading.Thread | None = None
 
     print(f"[CONFIG] DRY_RUN={settings.dry_run}, AUTO_REENTER={settings.auto_reenter_on_profit}", flush=True)
 
@@ -1502,6 +1578,29 @@ def run_telegram_bot() -> None:
                             _send_message(token, chat_id, f"✅ Multi-coin cycle đã bắt đầu với target {target_usdt:.4f} USDT.")
                             continue
 
+                        if normalized_text == "/mmo auto":
+                            if mmo_auto_thread is not None and mmo_auto_thread.is_alive():
+                                _send_message(token, chat_id, "MMO auto đang chạy. Dùng /mmo stop để dừng.")
+                                continue
+
+                            mmo_auto_stop_event.clear()
+                            mmo_auto_thread = threading.Thread(
+                                target=_run_mmo_auto_loop,
+                                args=(token, chat_id, mmo_auto_stop_event),
+                                daemon=True,
+                            )
+                            mmo_auto_thread.start()
+                            _send_message(token, chat_id, "✅ Đã bật MMO auto.")
+                            continue
+
+                        if normalized_text == "/mmo stop":
+                            if mmo_auto_thread is None or not mmo_auto_thread.is_alive():
+                                _send_message(token, chat_id, "MMO auto hiện không chạy.")
+                                continue
+                            mmo_auto_stop_event.set()
+                            _send_message(token, chat_id, "⏹ Đang dừng MMO auto...")
+                            continue
+
                         if text.strip().lower() == "/run openclaw trading":
                             _send_message(token, chat_id, "Đang làm việc... quét thị trường, chọn coin và chuẩn bị lệnh.")
 
@@ -1549,10 +1648,13 @@ def run_telegram_bot() -> None:
                 time.sleep(settings.telegram_poll_interval_sec)
     finally:
         stop_event.set()
+        mmo_auto_stop_event.set()
         for thread in refresh_threads:
             thread.join(timeout=2)
         if cycle_thread is not None:
             cycle_thread.join(timeout=2)
+        if mmo_auto_thread is not None:
+            mmo_auto_thread.join(timeout=2)
         if allowed_chat:
             try:
                 _send_message(token, allowed_chat, f"OpenClaw bot offline trên {host}.")

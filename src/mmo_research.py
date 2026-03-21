@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 from typing import Any
+
+import requests
 
 
 MMO_PROJECTS: list[dict[str, Any]] = [
@@ -267,8 +270,88 @@ def handle_mmo_command(raw_text: str) -> str:
     return (
         "MMO command không hợp lệ. Dùng:\n"
         "/mmo\n"
+        "/mmo auto\n"
+        "/mmo stop\n"
         "/mmo start\n"
         "/mmo steps\n"
         "/mmo status\n"
         "/mmo withdraw"
     )
+
+
+def get_mmo_auto_keywords() -> list[str]:
+    return list(AUTO_NICHE["keywords"])
+
+
+def format_mmo_auto_alert(scan_output: dict[str, Any], max_items: int = 3) -> str:
+    opportunities = scan_output.get("opportunities", []) if isinstance(scan_output, dict) else []
+    if not opportunities:
+        return "MMO auto: chưa có deal chênh lệch đủ tốt ở vòng quét này."
+
+    lines = [
+        "MMO auto alert: phát hiện deal tiềm năng",
+    ]
+    for idx, item in enumerate(opportunities[:max_items], start=1):
+        title = str(item.get("title") or "Unknown")
+        price = float(item.get("price") or 0.0)
+        baseline = float(item.get("baseline_price") or 0.0)
+        gap_pct = float(item.get("gap_pct") or 0.0)
+        keyword = str(item.get("keyword") or "")
+        lines.append(
+            f"{idx}) {title} | ${price:.2f} vs ${baseline:.2f} | gap {gap_pct:.1f}% | kw={keyword}"
+        )
+    return "\n".join(lines)
+
+
+def get_mmo_auto_scan_interval_sec() -> int:
+    raw = os.getenv("MMO_SCAN_INTERVAL_SEC", "600").strip()
+    try:
+        return max(60, min(int(raw), 86400))
+    except ValueError:
+        return 600
+
+
+def get_mmo_min_gap_pct() -> float:
+    raw = os.getenv("MMO_MIN_GAP_PCT", "12").strip()
+    try:
+        return max(1.0, min(float(raw), 90.0))
+    except ValueError:
+        return 12.0
+
+
+def fetch_affiliate_payout_status() -> dict[str, Any] | None:
+    """Optional payout status fetch.
+
+    Configure in .env:
+    - MMO_AFFILIATE_STATUS_URL: endpoint returning JSON
+    - MMO_AFFILIATE_STATUS_TOKEN: optional bearer token
+
+    Expected JSON fields (at least one):
+    - approved_balance
+    - pending_balance
+    - currency
+    - min_withdraw
+    """
+    url = os.getenv("MMO_AFFILIATE_STATUS_URL", "").strip()
+    if not url:
+        return None
+
+    token = os.getenv("MMO_AFFILIATE_STATUS_TOKEN", "").strip()
+    headers: dict[str, str] = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        response = requests.get(url, headers=headers, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            return None
+        return {
+            "approved_balance": float(data.get("approved_balance") or 0.0),
+            "pending_balance": float(data.get("pending_balance") or 0.0),
+            "currency": str(data.get("currency") or "USD"),
+            "min_withdraw": float(data.get("min_withdraw") or 0.0),
+        }
+    except Exception:
+        return None
