@@ -36,6 +36,8 @@ class Settings:
     pnl_monitor_max_min: int
     max_trade_candidates: int
     copilot_daily_query_limit: int
+    adaptive_review_min: int
+    binance_taker_fee_rate: float
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -71,6 +73,8 @@ def load_settings() -> Settings:
     pnl_monitor_max_min_raw = os.getenv("PNL_MONITOR_MAX_MIN", "45").strip()
     max_trade_candidates_raw = os.getenv("MAX_TRADE_CANDIDATES", "20").strip()
     copilot_daily_query_limit_raw = os.getenv("COPILOT_DAILY_QUERY_LIMIT", "100").strip()
+    adaptive_review_min_raw = os.getenv("ADAPTIVE_REVIEW_MIN", "30").strip()
+    binance_taker_fee_rate_raw = os.getenv("BINANCE_TAKER_FEE_RATE", "0.0005").strip()
 
     try:
         top_n = max(1, min(int(top_n_raw), 50))
@@ -147,6 +151,16 @@ def load_settings() -> Settings:
     except ValueError:
         copilot_daily_query_limit = 100
 
+    try:
+        adaptive_review_min = max(5, min(int(adaptive_review_min_raw), 240))
+    except ValueError:
+        adaptive_review_min = 30
+
+    try:
+        binance_taker_fee_rate = max(0.0, min(float(binance_taker_fee_rate_raw), 0.01))
+    except ValueError:
+        binance_taker_fee_rate = 0.0005
+
     return Settings(
         anthropic_api_key=api_key,
         model=model,
@@ -173,4 +187,6 @@ def load_settings() -> Settings:
         pnl_monitor_max_min=pnl_monitor_max_min,
         max_trade_candidates=max_trade_candidates,
         copilot_daily_query_limit=copilot_daily_query_limit,
+        adaptive_review_min=adaptive_review_min,
+        binance_taker_fee_rate=binance_taker_fee_rate,
     )
