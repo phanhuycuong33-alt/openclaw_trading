@@ -717,6 +717,7 @@ def _run_multi_trade_cycle(
     chat_id: str,
     stop_event: threading.Event,
     close_target_usdt: float,
+    review_after_sec: int | None = None,
 ) -> None:
     settings = load_settings()
     accumulated_realized_pnl = 0.0
@@ -750,12 +751,13 @@ def _run_multi_trade_cycle(
         symbols_text = ", ".join(
             str(item.get("trade_plan", {}).get("symbol") or "") for item in active_trades
         )
+        effective_review_after_sec = int(review_after_sec) if review_after_sec is not None else int(settings.adaptive_review_min * 60)
         header_lines = [
             f"Batch {cycle_index} started | Mode: {mode}",
             f"Balance: {available_balance:.4f} USDT | Opened: {len(active_trades)} lệnh | Coins: {symbols_text}",
             f"Budget used: {budget_used:.4f} | Reserve: {reserve_balance:.4f} | Remaining: {remaining_budget:.4f}",
             f"Close condition: tổng pnl >= {close_target_usdt:.4f} USDT",
-            f"Adaptive review (AI tự động): sau {settings.adaptive_review_min} phút nếu PnL âm",
+            f"Adaptive review (AI tự động): sau {effective_review_after_sec}s nếu PnL âm",
         ]
         if fallback_reason:
             header_lines.append(f"Fallback: {fallback_reason}")
@@ -804,10 +806,10 @@ def _run_multi_trade_cycle(
                 continue
 
             # ---------------------------------------------------------------
-            # Adaptive review trigger: after N minutes with negative PnL
+            # Adaptive review trigger: after N seconds with negative PnL
             # ---------------------------------------------------------------
             elapsed_sec = time.time() - batch_start_time
-            review_threshold_sec = settings.adaptive_review_min * 60
+            review_threshold_sec = effective_review_after_sec
 
             if (
                 not adaptive_review_done
@@ -817,11 +819,11 @@ def _run_multi_trade_cycle(
                 and active_trades
             ):
                 adaptive_review_done = True
-                elapsed_min = int(elapsed_sec // 60)
+                elapsed_s = int(elapsed_sec)
                 _send_message(
                     token,
                     chat_id,
-                    f"⏰ {elapsed_min} phút đã trôi qua – PnL vẫn âm ({total_pnl:+.4f} USDT). "
+                    f"⏰ {elapsed_s}s đã trôi qua – PnL vẫn âm ({total_pnl:+.4f} USDT). "
                     "Đang phân tích từng vị thế...",
                 )
                 try:
@@ -838,7 +840,7 @@ def _run_multi_trade_cycle(
                         token,
                         chat_id,
                         (
-                            f"🧠 Adaptive review ({llm_src}) sau {elapsed_min} phút: {action_summary}. "
+                            f"🧠 Adaptive review ({llm_src}) sau {elapsed_s}s: {action_summary}. "
                             "Đang tự động thực thi..."
                         ),
                     )
@@ -1017,7 +1019,7 @@ def _handle_command(text: str) -> tuple[str, bool, dict[str, Any] | None, bool]:
     if command in {"/start", "/help"}:
         return (
             "Commands:\n"
-            "/trade hoặc /trade <target_usdt> (multi-coin cycle)\n"
+            "/trade hoặc /trade <target_usdt> [review_after_sec] (multi-coin cycle)\n"
             "/run openclaw trading (single trade)\n"
             "/status\n/aiusage\n/stop"
         ), False, None, False
@@ -1126,6 +1128,7 @@ def run_telegram_bot() -> None:
                         if normalized_text.startswith("/trade"):
                             parts = text.strip().split()
                             target_usdt = settings.profit_reenter_usdt
+                            review_after_sec: int | None = None
 
                             if len(parts) >= 2:
                                 try:
@@ -1138,9 +1141,26 @@ def run_telegram_bot() -> None:
                                     _send_message(token, chat_id, "Sai format. Dùng: /trade hoặc /trade 0.1")
                                     continue
 
+                            if len(parts) >= 3:
+                                try:
+                                    parsed_review_sec = int(parts[2])
+                                    if parsed_review_sec <= 0:
+                                        _send_message(token, chat_id, "review_after_sec phải > 0. Ví dụ: /trade 0.1 15")
+                                        continue
+                                    review_after_sec = parsed_review_sec
+                                except ValueError:
+                                    _send_message(token, chat_id, "Sai format. Dùng: /trade hoặc /trade 0.1 15")
+                                    continue
+
                             if cycle_thread is not None and cycle_thread.is_alive():
                                 _send_message(token, chat_id, "⏳ Multi-coin cycle đang chạy, vui lòng chờ hoặc dùng /stop.")
                                 continue
+
+                            review_text = (
+                                f"{review_after_sec}s"
+                                if review_after_sec is not None
+                                else f"{settings.adaptive_review_min * 60}s"
+                            )
 
                             _send_message(
                                 token,
@@ -1149,12 +1169,12 @@ def run_telegram_bot() -> None:
                                     "Đang khởi động multi-coin cycle: chọn coin theo số dư, "
                                     f"report PnL mỗi {settings.pnl_refresh_sec}s, "
                                     f"close all khi tổng pnl >= {target_usdt:.4f} USDT. "
-                                    f"AI tự rotate coin nếu PnL âm sau {settings.adaptive_review_min} phút."
+                                    f"AI tự rotate coin nếu PnL âm sau {review_text}."
                                 ),
                             )
                             cycle_thread = threading.Thread(
                                 target=_run_multi_trade_cycle,
-                                args=(token, chat_id, stop_event, target_usdt),
+                                args=(token, chat_id, stop_event, target_usdt, review_after_sec),
                                 daemon=True,
                             )
                             cycle_thread.start()
