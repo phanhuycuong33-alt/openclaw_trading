@@ -88,6 +88,30 @@ def _estimate_close_fee(qty: float, mark_price: float, fee_rate: float) -> float
     return abs(qty) * mark_price * fee_rate
 
 
+def _choose_adaptive_leverage(coin_data: dict[str, Any], settings: Any) -> int:
+    base_leverage = max(1, int(settings.leverage))
+    score = float(coin_data.get("pump_probability_score") or 0.0)
+    abs_24h = abs(float(coin_data.get("price_change_percentage_24h") or 0.0))
+    abs_7d = abs(float(coin_data.get("price_change_percentage_7d_in_currency") or 0.0))
+    volume_score = float(coin_data.get("volume_score") or 0.0)
+
+    leverage = base_leverage
+
+    if abs_24h >= 15 or abs_7d >= 35:
+        leverage -= 2
+    elif abs_24h >= 10 or abs_7d >= 25:
+        leverage -= 1
+
+    if score < 0.45:
+        leverage = min(leverage, 2)
+    elif score < 0.65:
+        leverage = min(leverage, 3)
+    elif score >= 0.85 and volume_score >= 0.7 and abs_24h <= 8 and abs_7d <= 18:
+        leverage = base_leverage
+
+    return max(2 if base_leverage >= 2 else 1, min(leverage, base_leverage))
+
+
 # ---------------------------------------------------------------------------
 # Adaptive review analysis (rule-based + optional Claude override)
 # ---------------------------------------------------------------------------
@@ -311,7 +335,8 @@ def _open_single_replacement_trade(
         return None
 
     try:
-        min_margin = trader.get_min_trade_margin(replacement_symbol, settings.leverage, base_usdt_amount=1.0)
+        leverage = _choose_adaptive_leverage(coin_data, settings)
+        min_margin = trader.get_min_trade_margin(replacement_symbol, leverage, base_usdt_amount=1.0)
         allocated_margin = max(float(allocated_margin), float(min_margin))
         side = choose_side(coin_data)
         current_price = float(coin_data.get("current_price") or 0.0)
@@ -325,7 +350,7 @@ def _open_single_replacement_trade(
             symbol=replacement_symbol,
             side=side,
             usdt_amount=allocated_margin,
-            leverage=settings.leverage,
+            leverage=leverage,
             take_profit=tp_price,
             stop_loss=sl_price,
         )
@@ -643,6 +668,7 @@ def _build_cycle_trades() -> dict[str, Any]:
     budget_used = 0.0
 
     for coin, symbol in candidates:
+        leverage = _choose_adaptive_leverage(coin, settings)
         side = choose_side(coin)
         current_price = float(coin.get("current_price") or 0.0)
         tp_price, sl_price = compute_tp_sl(
@@ -655,7 +681,7 @@ def _build_cycle_trades() -> dict[str, Any]:
         try:
             required_margin = trader.get_min_trade_margin(
                 symbol=symbol,
-                leverage=settings.leverage,
+                leverage=leverage,
                 base_usdt_amount=1.0,
             )
             if required_margin > remaining_budget:
@@ -675,7 +701,7 @@ def _build_cycle_trades() -> dict[str, Any]:
                 symbol=symbol,
                 side=side,
                 usdt_amount=required_margin,
-                leverage=settings.leverage,
+                leverage=leverage,
                 take_profit=tp_price,
                 stop_loss=sl_price,
             )
@@ -751,6 +777,7 @@ def _format_cycle_report(
     active_trades: list[dict[str, Any]],
     price_trader: BinanceFuturesTrader,
     live_pnl_trader: BinanceFuturesTrader | None,
+    next_review_in_sec: int | None = None,
 ) -> tuple[str, float]:
     lines = [f"trade lần thứ {cycle_index} --- pnl tích luỹ = {accumulated_realized_pnl:+.4f}"]
     total_pnl = 0.0
@@ -779,6 +806,11 @@ def _format_cycle_report(
 
     status = "LỜI" if total_pnl >= 0 else "LỖ"
     lines.append(f"tổng pnl {total_pnl:+.6f} --> {status}")
+    if next_review_in_sec is not None:
+        if next_review_in_sec <= 0:
+            lines.append("adaptive review: đến hạn ở vòng kế tiếp")
+        else:
+            lines.append(f"adaptive review sau: {next_review_in_sec}s")
     return "\n".join(lines), total_pnl
 
 
@@ -968,6 +1000,12 @@ def _run_multi_trade_cycle(
             if stop_event.is_set():
                 break
 
+            elapsed_sec = time.time() - batch_start_time
+            review_threshold_sec = effective_review_after_sec
+            current_review_bucket = int(elapsed_sec // review_threshold_sec) if review_threshold_sec > 0 else 0
+            next_review_due_sec = review_threshold_sec * (current_review_bucket + 1) if review_threshold_sec > 0 else 0
+            next_review_in_sec = max(0, int(next_review_due_sec - elapsed_sec)) if review_threshold_sec > 0 else None
+
             try:
                 report, total_pnl = _format_cycle_report(
                     cycle_index,
@@ -975,6 +1013,7 @@ def _run_multi_trade_cycle(
                     active_trades,
                     price_trader,
                     live_pnl_trader,
+                    next_review_in_sec=next_review_in_sec,
                 )
                 _send_message(token, chat_id, report)
             except Exception as exc:
@@ -984,11 +1023,6 @@ def _run_multi_trade_cycle(
             # ---------------------------------------------------------------
             # Adaptive review trigger: after N seconds with negative PnL
             # ---------------------------------------------------------------
-            elapsed_sec = time.time() - batch_start_time
-            review_threshold_sec = effective_review_after_sec
-
-            current_review_bucket = int(elapsed_sec // review_threshold_sec) if review_threshold_sec > 0 else 0
-
             if (
                 review_threshold_sec > 0
                 and current_review_bucket > last_review_bucket
@@ -996,12 +1030,12 @@ def _run_multi_trade_cycle(
                 and active_trades
             ):
                 last_review_bucket = current_review_bucket
-                if total_pnl < 0:
+                if total_pnl < close_target_usdt:
                     elapsed_s = int(elapsed_sec)
                     _send_message(
                         token,
                         chat_id,
-                        f"⏰ {elapsed_s}s đã trôi qua – PnL vẫn âm ({total_pnl:+.4f} USDT). "
+                        f"⏰ {elapsed_s}s đã trôi qua – bắt đầu adaptive review (PnL {total_pnl:+.4f} USDT / target {close_target_usdt:+.4f}). "
                         "Đang phân tích từng vị thế...",
                     )
                     try:
