@@ -19,6 +19,66 @@ from src.web_fetcher import fetch_markets, fetch_trending
 from trade_openclaw import run_trading
 
 
+_SYMBOL_MEMORY_LOCK = threading.Lock()
+_SYMBOL_MEMORY: dict[str, dict[str, int]] = {}
+
+
+def _remember_symbol_outcome(symbol: str, pnl: float, force_exclude: bool = False) -> None:
+    symbol = str(symbol or "").upper()
+    if not symbol:
+        return
+
+    with _SYMBOL_MEMORY_LOCK:
+        state = _SYMBOL_MEMORY.setdefault(
+            symbol,
+            {"bad_runs": 0, "good_runs": 0, "exclude_batches": 0},
+        )
+        if pnl > 0:
+            state["good_runs"] += 1
+            state["exclude_batches"] = 0
+            if state["bad_runs"] > 0:
+                state["bad_runs"] -= 1
+        else:
+            state["bad_runs"] += 1
+            if force_exclude:
+                state["exclude_batches"] = max(
+                    int(state["exclude_batches"]),
+                    min(2, int(state["bad_runs"])),
+                )
+
+
+def _get_temporarily_excluded_symbols() -> set[str]:
+    with _SYMBOL_MEMORY_LOCK:
+        return {
+            symbol
+            for symbol, state in _SYMBOL_MEMORY.items()
+            if int(state.get("exclude_batches", 0)) > 0
+        }
+
+
+def _consume_symbol_exclusions(symbols: set[str]) -> None:
+    if not symbols:
+        return
+
+    with _SYMBOL_MEMORY_LOCK:
+        for symbol in symbols:
+            state = _SYMBOL_MEMORY.get(symbol)
+            if not state:
+                continue
+            current = int(state.get("exclude_batches", 0))
+            if current > 0:
+                state["exclude_batches"] = current - 1
+
+
+def _active_trade_symbols(active_trades: list[dict[str, Any]]) -> set[str]:
+    symbols: set[str] = set()
+    for item in active_trades:
+        symbol = str(item.get("trade_plan", {}).get("symbol") or "").upper()
+        if symbol:
+            symbols.add(symbol)
+    return symbols
+
+
 # ---------------------------------------------------------------------------
 # Fee estimation
 # ---------------------------------------------------------------------------
@@ -312,6 +372,8 @@ def _auto_execute_review_actions(
     for rec in recommendations:
         action = rec.get("action")
         if action == "HOLD":
+            if float(rec.get("current_pnl") or 0.0) > 0:
+                _remember_symbol_outcome(rec["symbol"], float(rec.get("current_pnl") or 0.0))
             new_active_trades.append(active_trades[rec["index"] - 1])
             continue
 
@@ -332,6 +394,13 @@ def _auto_execute_review_actions(
         else:
             close_ok = True
             executed_lines.append(f"✅ [PAPER] Close {symbol} (PnL {rec['current_pnl']:+.4f})")
+
+        if close_ok:
+            _remember_symbol_outcome(
+                symbol,
+                float(rec.get("current_pnl") or 0.0),
+                force_exclude=float(rec.get("current_pnl") or 0.0) <= 0,
+            )
 
         # Open replacement if applicable
         if close_ok and action == "CLOSE_REPLACE" and rec.get("replacement_symbol"):
@@ -354,6 +423,16 @@ def _auto_execute_review_actions(
                     executed_lines.append(f"  ↳ Không mở được {rep_sym}")
             except Exception as exc:
                 executed_lines.append(f"  ↳ Lỗi mở {rep_sym}: {exc}")
+
+    extra_trades, extra_lines = _try_top_up_portfolio(
+        trader=live_trader,
+        settings=settings,
+        active_trades=new_active_trades,
+        fresh_ranked=fresh_ranked,
+    )
+    if extra_trades:
+        new_active_trades.extend(extra_trades)
+    executed_lines.extend(extra_lines)
 
     if not executed_lines:
         _send_message(token, chat_id, "Adaptive review: không có vị thế cần đóng/thay thế.")
@@ -483,13 +562,15 @@ def _pick_supported_candidates(
     ranked: list[dict[str, Any]],
     trader: BinanceFuturesTrader,
     max_count: int,
+    excluded_symbols: set[str] | None = None,
 ) -> list[tuple[dict[str, Any], str]]:
     selected: list[tuple[dict[str, Any], str]] = []
     seen: set[str] = set()
+    excluded = {str(symbol).upper() for symbol in (excluded_symbols or set())}
 
     for coin in ranked:
         symbol = f"{str(coin.get('symbol', '')).upper()}USDT"
-        if not symbol or symbol == "USDT" or symbol in seen:
+        if not symbol or symbol == "USDT" or symbol in seen or symbol in excluded:
             continue
         if trader.supports_symbol(symbol):
             selected.append((coin, symbol))
@@ -546,7 +627,14 @@ def _build_cycle_trades() -> dict[str, Any]:
     if not ranked:
         raise RuntimeError("Không có dữ liệu thị trường để chọn coin")
 
-    candidates = _pick_supported_candidates(ranked, trader, settings.max_trade_candidates)
+    temporarily_excluded_symbols = _get_temporarily_excluded_symbols()
+    candidates = _pick_supported_candidates(
+        ranked,
+        trader,
+        settings.max_trade_candidates,
+        excluded_symbols=temporarily_excluded_symbols,
+    )
+    _consume_symbol_exclusions(temporarily_excluded_symbols)
     if not candidates:
         raise RuntimeError("Không tìm thấy coin futures phù hợp")
 
@@ -712,6 +800,94 @@ def _close_all_batch_positions(trader: BinanceFuturesTrader, active_trades: list
     return closed, errors
 
 
+def _collect_trade_pnl_snapshots(
+    active_trades: list[dict[str, Any]],
+    price_trader: BinanceFuturesTrader,
+    live_pnl_trader: BinanceFuturesTrader | None,
+) -> list[dict[str, Any]]:
+    snapshots: list[dict[str, Any]] = []
+
+    for item in active_trades:
+        plan = item.get("trade_plan", {})
+        symbol = str(plan.get("symbol") or "").upper()
+        if not symbol:
+            continue
+
+        is_paper = bool(plan.get("dry_run"))
+        if not is_paper and live_pnl_trader is not None:
+            snapshot = live_pnl_trader.get_position_snapshot(symbol)
+            pnl = float(snapshot.get("unrealized_pnl") or 0.0)
+        else:
+            current_price = price_trader.get_symbol_price(symbol)
+            pnl, _, _, _ = _calculate_plan_pnl(plan, current_price)
+
+        snapshots.append({"symbol": symbol, "pnl": pnl})
+
+    return snapshots
+
+
+def _try_top_up_portfolio(
+    trader: BinanceFuturesTrader,
+    settings: Any,
+    active_trades: list[dict[str, Any]],
+    fresh_ranked: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    opened_trades: list[dict[str, Any]] = []
+    log_lines: list[str] = []
+    working_active_trades = list(active_trades)
+
+    try:
+        available_balance = float(trader.get_available_usdt_balance())
+    except Exception as exc:
+        return [], [f"  ↳ Không đọc được số dư để top-up: {exc}"]
+
+    if available_balance < 1.0:
+        return [], []
+
+    excluded_symbols = _active_trade_symbols(working_active_trades) | _get_temporarily_excluded_symbols()
+    candidates = _pick_supported_candidates(
+        fresh_ranked,
+        trader,
+        settings.max_trade_candidates,
+        excluded_symbols=excluded_symbols,
+    )
+
+    for coin, symbol in candidates:
+        try:
+            required_margin = trader.get_min_trade_margin(
+                symbol=symbol,
+                leverage=settings.leverage,
+                base_usdt_amount=1.0,
+            )
+            if required_margin > available_balance:
+                continue
+
+            new_trade = _open_single_replacement_trade(
+                replacement_symbol=symbol,
+                trader=trader,
+                settings=settings,
+                allocated_margin=required_margin,
+                fresh_ranked=fresh_ranked,
+            )
+            if not new_trade:
+                log_lines.append(f"  ↳ Retry mở {symbol} thất bại")
+                continue
+
+            opened_trades.append(new_trade)
+            working_active_trades.append(new_trade)
+            excluded_symbols.add(symbol)
+            used_margin = float(new_trade.get("allocated_margin") or required_margin)
+            available_balance = max(0.0, available_balance - used_margin)
+            log_lines.append(f"  ↳ Top-up mở {symbol} (margin ≈ {used_margin:.4f} USDT)")
+
+            if available_balance < 1.0:
+                break
+        except Exception as exc:
+            log_lines.append(f"  ↳ Retry mở {symbol} lỗi: {exc}")
+
+    return opened_trades, log_lines
+
+
 def _run_multi_trade_cycle(
     token: str,
     chat_id: str,
@@ -781,7 +957,7 @@ def _run_multi_trade_cycle(
                 live_pnl_trader = None
 
         batch_start_time = time.time()
-        adaptive_review_done = False  # only trigger once per batch
+        last_review_bucket = 0
 
         while not stop_event.is_set():
             remaining = settings.pnl_refresh_sec
@@ -811,71 +987,73 @@ def _run_multi_trade_cycle(
             elapsed_sec = time.time() - batch_start_time
             review_threshold_sec = effective_review_after_sec
 
+            current_review_bucket = int(elapsed_sec // review_threshold_sec) if review_threshold_sec > 0 else 0
+
             if (
-                not adaptive_review_done
-                and elapsed_sec >= review_threshold_sec
-                and total_pnl < 0
+                review_threshold_sec > 0
+                and current_review_bucket > last_review_bucket
                 and not stop_event.is_set()
                 and active_trades
             ):
-                adaptive_review_done = True
-                elapsed_s = int(elapsed_sec)
-                _send_message(
-                    token,
-                    chat_id,
-                    f"⏰ {elapsed_s}s đã trôi qua – PnL vẫn âm ({total_pnl:+.4f} USDT). "
-                    "Đang phân tích từng vị thế...",
-                )
-                try:
-                    recommendations, fresh_ranked, llm_src = _build_adaptive_review_recommendations(
-                        active_trades,
-                        live_pnl_trader,
-                        price_trader,
-                        settings,
-                    )
-                    action_summary = ", ".join(
-                        f"{rec['symbol']}={rec['action']}" for rec in recommendations
-                    )
+                last_review_bucket = current_review_bucket
+                if total_pnl < 0:
+                    elapsed_s = int(elapsed_sec)
                     _send_message(
                         token,
                         chat_id,
-                        (
-                            f"🧠 Adaptive review ({llm_src}) sau {elapsed_s}s: {action_summary}. "
-                            "Đang tự động thực thi..."
-                        ),
+                        f"⏰ {elapsed_s}s đã trôi qua – PnL vẫn âm ({total_pnl:+.4f} USDT). "
+                        "Đang phân tích từng vị thế...",
                     )
-
-                    first_plan = active_trades[0].get("trade_plan", {}) if active_trades else {}
-                    is_paper = bool(first_plan.get("dry_run"))
-                    exec_trader = live_pnl_trader if (live_pnl_trader and not is_paper) else price_trader
-                    active_trades = _auto_execute_review_actions(
-                        recommendations=recommendations,
-                        active_trades=active_trades,
-                        live_trader=exec_trader,
-                        settings=settings,
-                        token=token,
-                        chat_id=chat_id,
-                        fresh_ranked=fresh_ranked,
-                    )
-
-                    if active_trades:
-                        new_symbols = ", ".join(
-                            str(t.get("trade_plan", {}).get("symbol") or "") for t in active_trades
+                    try:
+                        recommendations, fresh_ranked, llm_src = _build_adaptive_review_recommendations(
+                            active_trades,
+                            live_pnl_trader,
+                            price_trader,
+                            settings,
+                        )
+                        action_summary = ", ".join(
+                            f"{rec['symbol']}={rec['action']}" for rec in recommendations
                         )
                         _send_message(
                             token,
                             chat_id,
-                            f"Portfolio sau adaptive review: {new_symbols} ({len(active_trades)} vị thế)",
+                            (
+                                f"🧠 Adaptive review ({llm_src}) sau {elapsed_s}s: {action_summary}. "
+                                "Đang tự động thực thi..."
+                            ),
                         )
-                    else:
-                        _send_message(
-                            token,
-                            chat_id,
-                            "Tất cả vị thế đã đóng sau adaptive review – bắt đầu batch mới.",
+
+                        first_plan = active_trades[0].get("trade_plan", {}) if active_trades else {}
+                        is_paper = bool(first_plan.get("dry_run"))
+                        exec_trader = live_pnl_trader if (live_pnl_trader and not is_paper) else price_trader
+                        active_trades = _auto_execute_review_actions(
+                            recommendations=recommendations,
+                            active_trades=active_trades,
+                            live_trader=exec_trader,
+                            settings=settings,
+                            token=token,
+                            chat_id=chat_id,
+                            fresh_ranked=fresh_ranked,
                         )
-                        break  # restart outer while loop to open new batch
-                except Exception as exc:
-                    _send_message(token, chat_id, f"Lỗi adaptive review: {exc}")
+
+                        if active_trades:
+                            new_symbols = ", ".join(
+                                str(t.get("trade_plan", {}).get("symbol") or "") for t in active_trades
+                            )
+                            _send_message(
+                                token,
+                                chat_id,
+                                f"Portfolio sau adaptive review: {new_symbols} ({len(active_trades)} vị thế)",
+                            )
+                        else:
+                            _send_message(
+                                token,
+                                chat_id,
+                                "Tất cả vị thế đã đóng sau adaptive review – bắt đầu batch mới.",
+                            )
+                            break  # restart outer while loop to open new batch
+                    except Exception as exc:
+                        _send_message(token, chat_id, f"Lỗi adaptive review: {exc}")
 
             # ---------------------------------------------------------------
             # Normal close condition
@@ -884,6 +1062,18 @@ def _run_multi_trade_cycle(
                 try:
                     first_plan = active_trades[0].get("trade_plan", {}) if active_trades else {}
                     is_paper = bool(first_plan.get("dry_run"))
+                    pnl_snapshots = _collect_trade_pnl_snapshots(
+                        active_trades,
+                        price_trader,
+                        live_pnl_trader,
+                    )
+                    for snapshot in pnl_snapshots:
+                        pnl_value = float(snapshot.get("pnl") or 0.0)
+                        _remember_symbol_outcome(
+                            str(snapshot.get("symbol") or ""),
+                            pnl_value,
+                            force_exclude=pnl_value <= 0,
+                        )
                     if not is_paper:
                         live_trader = BinanceFuturesTrader(
                             api_key=settings.binance_api_key,
