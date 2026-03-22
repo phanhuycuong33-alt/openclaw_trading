@@ -64,6 +64,10 @@ class OpenClawManager:
         self.build_conversation_state = "IDLE"  # IDLE | ASKING_TASK | CONFIRMING_TASK | BUILDING
         self.build_pending_description = ""  # temp storage for user description
         self.build_pending_details = {}  # temp storage for task details
+        
+        # Interactive process mode — keep a running process for user interaction
+        self.interactive_process: subprocess.Popen[str] | None = None  # currently running interactive process
+        self.process_is_interactive = False  # whether process expects stdin interaction
 
         if not self.token:
             raise RuntimeError("Thiếu TELEGRAM_BOT_TOKEN trong .env")
@@ -183,6 +187,113 @@ class OpenClawManager:
     # AI code generator  (/command ... /run /code)
     # ------------------------------------------------------------------
 
+    def _start_interactive_process(self, file_path: Path) -> tuple[str, bool]:
+        """Start a process with interactive stdin/stdout for user interaction.
+        Returns (initial_output, is_running).
+        """
+        # Stop any existing process
+        if self.interactive_process and self.interactive_process.poll() is None:
+            try:
+                self.interactive_process.terminate()
+                self.interactive_process.wait(timeout=2)
+            except:
+                pass
+        
+        cmd = [sys.executable, str(file_path)] if file_path.suffix == ".py" else ["bash", str(file_path)]
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,  # Combine stderr with stdout
+                text=True,
+                bufsize=1,  # Line-buffered
+                cwd=str(self.root_dir),
+            )
+            
+            self.interactive_process = proc
+            self.process_is_interactive = True
+            
+            # Try to read initial output (non-blocking check)
+            import select
+            import time
+            time.sleep(0.1)  # Let process start and produce output
+            
+            initial_output = ""
+            try:
+                # Read available output without blocking
+                while True:
+                    ready, _, _ = select.select([proc.stdout], [], [], 0.1)
+                    if not ready:
+                        break
+                    line = proc.stdout.readline() if proc.stdout else ""
+                    if not line:
+                        break
+                    initial_output += line
+            except:
+                pass
+            
+            if proc.poll() is not None:
+                # Process already exited
+                remaining = proc.stdout.read() if proc.stdout else ""
+                initial_output += remaining
+                self.interactive_process = None
+                return initial_output, False
+            
+            # Process still running
+            return (initial_output or "Process started, waiting for input..."), True
+        
+        except Exception as exc:
+            self.interactive_process = None
+            return f"Loi khi start process: {exc}", False
+    
+    def _send_to_interactive_process(self, user_input: str) -> str:
+        """Send user input to running process and get output."""
+        if not self.interactive_process or self.interactive_process.poll() is not None:
+            self.interactive_process = None
+            return "Khong co process dang chay. Dung /run de start lai."
+        
+        try:
+            # Send input to process
+            self.interactive_process.stdin.write(user_input + "\n")
+            self.interactive_process.stdin.flush()
+            
+            # Read output
+            import select
+            output = ""
+            timeout_count = 0
+            max_timeout = 5  # seconds
+            
+            while timeout_count < max_timeout:
+                try:
+                    ready, _, _ = select.select([self.interactive_process.stdout], [], [], 0.5)
+                    if ready:
+                        line = self.interactive_process.stdout.readline()
+                        if not line:
+                            if self.interactive_process.poll() is not None:
+                                # Process exited
+                                break
+                            timeout_count += 1
+                            continue
+                        output += line
+                        timeout_count = 0  # Reset on successful read
+                    else:
+                        timeout_count += 1
+                except:
+                    break
+            
+            if self.interactive_process.poll() is not None:
+                # Process ended
+                self.interactive_process = None
+                self.process_is_interactive = False
+                return output + "\n(Process ended)"
+            
+            return output or "(no output)"
+        
+        except Exception as exc:
+            self.interactive_process = None
+            return f"Loi: {exc}"
+
     def _execute_file(self, file_path: Path, timeout_sec: int = 60) -> tuple[int, str, str, bool]:
         cmd = [sys.executable, str(file_path)] if file_path.suffix == ".py" else ["bash", str(file_path)]
         try:
@@ -220,6 +331,34 @@ class OpenClawManager:
             for k in ["starting server", "running on", "serving", "http://", "0.0.0.0"]
         )
         return app_like and started_hint
+
+    def _is_interactive_code(self, code: str, description: str) -> bool:
+        """Detect if code expects user input (calculator, game, chat, etc)."""
+        code_lower = code.lower()
+        desc_lower = description.lower()
+        
+        # Keywords that indicate interactive code
+        interactive_keywords = [
+            "input(", "raw_input(", "sys.stdin", "scanner", 
+            "calculator", "game", "chat", "interactive", "prompt",
+            "menu", "choose", "select", "option"
+        ]
+        
+        # Check code for input() calls
+        if "input(" in code_lower:
+            return True
+        
+        # Check description for interactive hints
+        for kw in interactive_keywords:
+            if kw in desc_lower:
+                return True
+        
+        # Check if code is very short and simple (likely interactive script)
+        lines = [l.strip() for l in code.split('\n') if l.strip() and not l.strip().startswith('#')]
+        if len(lines) < 10 and "input(" in code_lower:
+            return True
+        
+        return False
 
     def _auto_install_missing_module(self, module_name: str) -> tuple[bool, str]:
         package_map = {
@@ -436,7 +575,56 @@ class OpenClawManager:
         self.last_command_description = description
         
         # Run it
-        cmd = [sys.executable, str(gen_file)]
+        # Check if code is interactive or long-running
+        is_interactive = self._is_interactive_code(code, description)
+        is_long_running = self._is_expected_long_running(description, "", "")
+        
+        # If interactive: start process and keep it running for user input
+        if is_interactive:
+            initial_output, is_running = self._start_interactive_process(gen_file)
+            self.build_conversation_state = "IDLE"
+            if is_running:
+                return (
+                    f"✅ Build thành công - Chương trình đang chạy!\n\n"
+                    f"📄 File: {gen_file.name}\n"
+                    f"🔧 Engine: [{engine}]\n"
+                    f"📥 Output:\n{initial_output}\n\n"
+                    f"Gõ input của bạn (hoặc /stop_process để dừng):"
+                ), False
+            else:
+                return (
+                    f"❌ Process ended immediately.\n\n"
+                    f"📄 File: {gen_file.name}\n"
+                    f"Output:\n{initial_output[:500]}\n\n"
+                    f"Dùng /retry để sửa lỗi."
+                ), False
+        
+        # If long-running (web server): start process in background
+        if is_long_running:
+            try:
+                cmd = [sys.executable, str(gen_file)]
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    cwd=str(self.root_dir),
+                )
+                self.interactive_process = proc
+                self.build_conversation_state = "IDLE"
+                port_hint = "5000" if "5000" in code else "3000"
+                return (
+                    f"✅ Build thành công - Server đang chạy!\n\n"
+                    f"📄 File: {gen_file.name}\n"
+                    f"🔧 Engine: [{engine}]\n"
+                    f"Truy cập: http://localhost:{port_hint}\n\n"
+                    f"Dùng /stop build để dừng."
+                ), False
+            except Exception as exc:
+                self.build_conversation_state = "IDLE"
+                return f"❌ Loi khi start server: {exc}", False
+        
+        # Otherwise: run normally and capture output
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=60, cwd=str(self.root_dir)
@@ -449,11 +637,11 @@ class OpenClawManager:
                 output_summary = out[:500] if len(out) < 500 else out[:500] + "..."
                 self.build_conversation_state = "IDLE"
                 return (
-                    f"✅ Build thành công!\n\n"
+                    f"✅ Build thanh cong!\n\n"
                     f"📄 File: {gen_file.name}\n"
                     f"🔧 Engine: [{engine}]\n"
                     f"✨ Output:\n{output_summary}\n\n"
-                    f"Dùng /code để xem source, /run để chạy lại, /retry để sửa lỗi.\n"
+                    f"Dung /code de xem source, /run de chay lai, /retry de sua loi.\n"
                     f"Gõ /stop build để tắt build mode."
                 ), False
             else:
@@ -461,9 +649,19 @@ class OpenClawManager:
                 error_msg = err or out or "Unknown error"
                 self.build_conversation_state = "IDLE"
                 return (
-                    f"❌ Build có lỗi:\n\n{error_msg[:800]}\n\n"
-                    f"Dùng /retry để tự động sửa, hoặc /start build lại."
+                    f"Error - Build co loi:\n\n{error_msg[:800]}\n\n"
+                    f"Dung /retry de sua, hoac /start build lai."
                 ), False
+        except subprocess.TimeoutExpired:
+            self.build_conversation_state = "IDLE"
+            return (
+                f"Process timeout sau 60 giay.\n\n"
+                f"File: {gen_file.name}\n"
+                f"Dung /retry de sua, hoac /code de xem source."
+            ), False
+        except Exception as exc:
+            self.build_conversation_state = "IDLE"
+            return f"Error khi build: {exc}", False
         except subprocess.TimeoutExpired:
             # Long-running app (web server) — timeout is expected
             if self._is_expected_long_running(description, "", ""):
@@ -883,6 +1081,27 @@ class OpenClawManager:
                         continue
 
                     reply, should_stop_manager = self._handle_command(text)
+                    # Check if there's an interactive process running first
+                    if self.interactive_process and self.interactive_process.poll() is None and not text.lower().startswith("/"):
+                        # User input to interactive process (not a command)
+                        reply = self._send_to_interactive_process(text)
+                        should_stop_manager = False
+                    elif text.strip().lower() == "/stop_process":
+                        # User wants to stop the running process
+                        if self.interactive_process:
+                            try:
+                                self.interactive_process.terminate()
+                                self.interactive_process.wait(timeout=2)
+                            except:
+                                pass
+                            self.interactive_process = None
+                            self.process_is_interactive = False
+                            reply = "Process stopped."
+                        else:
+                            reply = "No process running."
+                        should_stop_manager = False
+                    else:
+                        reply, should_stop_manager = self._handle_command(text)
                     _send_message(self.token, chat_id, reply)
                     if should_stop_manager:
                         break
