@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import datetime
@@ -422,7 +423,7 @@ class OpenClawManager:
         
         # Generate code
         try:
-            _send_message(self.token, self.allowed_chat, "⏳ Giờ tôi đang build... vui lòng chờ")
+            _send_message(self.token, self.allowed_chat, "Dang tao code... vui long cho")
         except:
             pass
         
