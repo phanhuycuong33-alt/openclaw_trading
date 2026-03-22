@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
 import socket
 import subprocess
+import textwrap
 import time
 from pathlib import Path
 from typing import Any
@@ -41,12 +43,15 @@ class OpenClawManager:
         ).strip()
         self.poll_interval_sec = max(1, int(os.getenv("TELEGRAM_POLL_INTERVAL_SEC", "2")))
         self.running = True
-        self.child_proc: subprocess.Popen[str] | None = None
+        self.trade_proc: subprocess.Popen[str] | None = None
+        self.mmo_proc: subprocess.Popen[str] | None = None
         self.offset: int | None = None
         self.host = socket.gethostname()
         self.root_dir = Path(__file__).resolve().parent
-        self.child_token_override = os.getenv("OPENCLAW_TELEGRAM_BOT_TOKEN", "").strip()
-        self.child_chat_override = os.getenv("OPENCLAW_TELEGRAM_ALLOWED_CHAT_ID", "").strip()
+        self.trade_token_override = os.getenv("OPENCLAW_TELEGRAM_BOT_TOKEN", "").strip()
+        self.trade_chat_override = os.getenv("OPENCLAW_TELEGRAM_ALLOWED_CHAT_ID", "").strip()
+        self.mmo_token_override = os.getenv("MMO_TELEGRAM_BOT_TOKEN", "").strip()
+        self.mmo_chat_override = os.getenv("MMO_TELEGRAM_ALLOWED_CHAT_ID", "").strip()
 
         if not self.token:
             raise RuntimeError("Thiếu TELEGRAM_BOT_TOKEN trong .env")
@@ -70,30 +75,46 @@ class OpenClawManager:
         except Exception as exc:
             return f"Close all positions thất bại: {exc}"
 
-    def _is_child_running(self) -> bool:
-        return self.child_proc is not None and self.child_proc.poll() is None
+    def _is_proc_running(self, proc: subprocess.Popen[str] | None) -> bool:
+        return proc is not None and proc.poll() is None
 
-    def _start_child(self) -> str:
-        if self._is_child_running():
-            return "OpenClaw telegram bot đang chạy rồi."
+    def _is_trade_running(self) -> bool:
+        return self._is_proc_running(self.trade_proc)
 
-        child_token = self.child_token_override or self.token
+    def _is_mmo_running(self) -> bool:
+        return self._is_proc_running(self.mmo_proc)
+
+    def _start_bot(self, mode: str) -> str:
+        if mode == "trade":
+            if self._is_trade_running():
+                return "Trade bot đang chạy rồi."
+            token_override = self.trade_token_override
+            chat_override = self.trade_chat_override
+            label = "Trade"
+        else:
+            if self._is_mmo_running():
+                return "MMO bot đang chạy rồi."
+            token_override = self.mmo_token_override
+            chat_override = self.mmo_chat_override
+            label = "MMO"
+
+        child_token = token_override or self.token
         if child_token == self.token:
             return (
-                "Không thể /start vì manager và bot con đang dùng cùng TELEGRAM token -> gây lỗi 409 Conflict.\n"
-                "Hãy cấu hình 2 bot riêng trong .env:\n"
+                f"Không thể /start {mode} vì manager và bot con dùng cùng TELEGRAM token -> lỗi 409 Conflict.\n"
+                "Hãy cấu hình bot riêng trong .env:\n"
                 "- MANAGER_TELEGRAM_BOT_TOKEN=...\n"
-                "- OPENCLAW_TELEGRAM_BOT_TOKEN=...\n"
+                f"- {('OPENCLAW' if mode == 'trade' else 'MMO')}_TELEGRAM_BOT_TOKEN=...\n"
                 "(và có thể tách chat id tương ứng)."
             )
 
         child_env = os.environ.copy()
-        if self.child_token_override:
-            child_env["TELEGRAM_BOT_TOKEN"] = self.child_token_override
-        if self.child_chat_override:
-            child_env["TELEGRAM_ALLOWED_CHAT_ID"] = self.child_chat_override
+        if token_override:
+            child_env["TELEGRAM_BOT_TOKEN"] = token_override
+        if chat_override:
+            child_env["TELEGRAM_ALLOWED_CHAT_ID"] = chat_override
 
-        self.child_proc = subprocess.Popen(
+        proc = subprocess.Popen(
             ["./run", "openclaw", "telegram"],
             cwd=str(self.root_dir),
             env=child_env,
@@ -101,31 +122,160 @@ class OpenClawManager:
             stderr=None,
             text=True,
         )
-        return f"Đã start OpenClaw telegram bot (pid={self.child_proc.pid})."
+        if mode == "trade":
+            self.trade_proc = proc
+        else:
+            self.mmo_proc = proc
+        return f"Đã start {label} telegram bot (pid={proc.pid})."
 
-    def _stop_child(self) -> str:
-        if not self._is_child_running():
-            self.child_proc = None
-            return "OpenClaw telegram bot hiện không chạy."
+    def _stop_bot(self, mode: str, close_positions: bool = False) -> str:
+        proc = self.trade_proc if mode == "trade" else self.mmo_proc
+        label = "Trade" if mode == "trade" else "MMO"
+        if not self._is_proc_running(proc):
+            if mode == "trade":
+                self.trade_proc = None
+            else:
+                self.mmo_proc = None
+            return f"{label} bot hiện không chạy."
 
-        assert self.child_proc is not None
+        assert proc is not None
+
+        prefix = ""
+        if close_positions:
+            prefix = self._close_all_positions() + "\n"
 
         try:
-            self.child_proc.send_signal(signal.SIGINT)
-            self.child_proc.wait(timeout=12)
-            code = self.child_proc.returncode
-            self.child_proc = None
-            return f"Đã stop OpenClaw telegram bot (exit={code})."
+            proc.send_signal(signal.SIGINT)
+            proc.wait(timeout=12)
+            code = proc.returncode
+            if mode == "trade":
+                self.trade_proc = None
+            else:
+                self.mmo_proc = None
+            return f"{prefix}Đã stop {label} telegram bot (exit={code})."
         except subprocess.TimeoutExpired:
-            self.child_proc.terminate()
+            proc.terminate()
             try:
-                self.child_proc.wait(timeout=5)
+                proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                self.child_proc.kill()
-                self.child_proc.wait(timeout=5)
-            code = self.child_proc.returncode
-            self.child_proc = None
-            return f"Đã force terminate OpenClaw telegram bot (exit={code})."
+                proc.kill()
+                proc.wait(timeout=5)
+            code = proc.returncode
+            if mode == "trade":
+                self.trade_proc = None
+            else:
+                self.mmo_proc = None
+            return f"{prefix}Đã force terminate {label} telegram bot (exit={code})."
+
+    # ------------------------------------------------------------------
+    # Natural-language shell task handler
+    # ------------------------------------------------------------------
+
+    def _handle_shell_task(self, text: str) -> str | None:
+        """Parse natural-language commands, run them on the server, return output.
+        Returns None if the text doesn't match any recognised pattern.
+        Supported:
+          - 'tao/tạo/create script <name>'  → write + run a Python hello-world script
+          - 'down/clone/download repo <kw>' → GitHub search + git clone top result
+          - 'run/chay/chạy <filename>'      → execute an existing script/file
+        """
+        lower = text.lower()
+
+        # ---- create / tạo script -----------------------------------------------
+        if re.search(r"(tao|t[aạ]o|create|make).{0,20}script", lower):
+            m = re.search(r"['\"](.*?)['\"]", text)
+            raw_name = m.group(1) if m else "hello_world"
+            safe_name = re.sub(r"[^\w\-. ]", "_", raw_name).strip().replace(" ", "_")
+            if not safe_name.endswith(".py"):
+                safe_name += ".py"
+            script_path = self.root_dir / safe_name
+            script_path.write_text(
+                textwrap.dedent(f"""\
+                    # auto-generated by manager bot
+                    print("Hello World - {raw_name}")
+                    """)
+            )
+            try:
+                proc = subprocess.run(
+                    ["python3", str(script_path)],
+                    capture_output=True, text=True, timeout=30,
+                )
+                out = proc.stdout.strip() or "(no stdout)"
+                err = f"\nStderr: {proc.stderr.strip()}" if proc.stderr.strip() else ""
+                return f"Đã tạo {safe_name} và chạy:\nOutput: {out}{err}"
+            except Exception as exc:
+                return f"Đã tạo {safe_name} nhưng chạy thất bại: {exc}"
+
+        # ---- down / clone repo --------------------------------------------------
+        if re.search(r"(down|clone|download|t[aả]i).{0,20}(repo|github)", lower):
+            m = re.search(r"['\"](.*?)['\"]", text)
+            kw = m.group(1) if m else re.split(r"\s+", text.strip())[-1]
+            try:
+                resp = requests.get(
+                    "https://api.github.com/search/repositories",
+                    params={"q": kw, "sort": "stars", "per_page": 1},
+                    headers={"Accept": "application/vnd.github+json"},
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                items = resp.json().get("items", [])
+                if not items:
+                    return f"Không tìm thấy repo nào trên GitHub với keyword '{kw}'."
+                repo = items[0]
+                clone_url = repo["clone_url"]
+                repo_name = repo["name"]
+                stars = repo["stargazers_count"]
+                clone_dir = self.root_dir / repo_name
+                if clone_dir.exists():
+                    return (
+                        f"Repo '{repo_name}' đã tồn tại tại {clone_dir.name}/\n"
+                        f"URL: {repo['html_url']} (⭐{stars})"
+                    )
+                result = subprocess.run(
+                    ["git", "clone", "--depth=1", clone_url, str(clone_dir)],
+                    capture_output=True, text=True, timeout=120,
+                )
+                combined = (result.stdout + result.stderr).strip()
+                if result.returncode == 0:
+                    return (
+                        f"Đã clone: {repo['full_name']} (⭐{stars})\n"
+                        f"URL: {repo['html_url']}\n"
+                        f"Thư mục: {clone_dir.name}/"
+                    )
+                else:
+                    return f"Clone thất bại (exit {result.returncode}):\n{combined[:800]}"
+            except Exception as exc:
+                return f"Lỗi khi tìm/clone repo: {exc}"
+
+        # ---- run / chạy existing script ----------------------------------------
+        if re.search(r"(run|chay|ch[aạ]y|execute|exec).{0,30}['\"]", lower):
+            m = re.search(r"['\"](.*?)['\"]", text)
+            if m:
+                target = m.group(1).strip()
+                script_path = self.root_dir / target
+                if not script_path.exists():
+                    # try with .py
+                    script_path = self.root_dir / (target + ".py")
+                if not script_path.exists():
+                    return f"Không tìm thấy file '{target}' trong {self.root_dir}."
+                suffix = script_path.suffix
+                cmd = ["python3", str(script_path)] if suffix == ".py" else ["bash", str(script_path)]
+                try:
+                    proc = subprocess.run(
+                        cmd, capture_output=True, text=True, timeout=60,
+                        cwd=str(self.root_dir),
+                    )
+                    out = proc.stdout.strip() or "(no stdout)"
+                    err = f"\nStderr: {proc.stderr.strip()}" if proc.stderr.strip() else ""
+                    return f"Run '{script_path.name}' (exit {proc.returncode}):\n{out[:1200]}{err}"
+                except subprocess.TimeoutExpired:
+                    return f"Script '{script_path.name}' timeout sau 60 giây."
+                except Exception as exc:
+                    return f"Lỗi khi chạy '{script_path.name}': {exc}"
+
+        return None
+
+    # ------------------------------------------------------------------
 
     def _handle_command(self, text: str) -> tuple[str, bool]:
         command = text.strip().lower()
@@ -133,62 +283,88 @@ class OpenClawManager:
         if command in {"/help", "/start manager", "/manager"}:
             return (
                 "Manager commands:\n"
-                "/start -> chạy ./run openclaw telegram\n"
-                "/stop -> stop ./run openclaw telegram (manager vẫn chạy)\n"
-                "/stop force -> stop bot và stop luôn manager\n"
-                "/status -> trạng thái manager/process"
+                "/start trade  → chạy trade telegram bot\n"
+                "/start mmo    → chạy mmo telegram bot\n"
+                "/stop trade   → stop trade bot (kèm close all)\n"
+                "/stop mmo     → stop mmo bot\n"
+                "/stop force   → stop bot + dừng manager\n"
+                "/status       → trạng thái processes\n"
+                "\nShell tasks (viết tự nhiên):\n"
+                "  tao script 'hello world'  → tạo + chạy Python script\n"
+                "  down repo 'trade coin'    → clone GitHub repo\n"
+                "  run 'ten_file.py'         → chạy file có sẵn"
             ), False
 
-        if command == "/start":
-            return self._start_child(), False
+        if command in {"/start", "/start trade"}:
+            return self._start_bot("trade"), False
 
-        if command == "/stop":
-            close_msg = self._close_all_positions()
-            stop_msg = self._stop_child()
-            return f"{close_msg}\n{stop_msg}", False
+        if command == "/start mmo":
+            return self._start_bot("mmo"), False
+
+        if command in {"/stop", "/stop trade"}:
+            return self._stop_bot("trade", close_positions=True), False
+
+        if command == "/stop mmo":
+            return self._stop_bot("mmo", close_positions=False), False
 
         if command == "/stop force":
-            close_msg = self._close_all_positions()
-            stop_msg = self._stop_child()
+            stop_trade = self._stop_bot("trade", close_positions=True)
+            stop_mmo = self._stop_bot("mmo", close_positions=False)
             self.running = False
-            return f"{close_msg}\n{stop_msg}\nManager sẽ dừng ngay.", True
+            return f"{stop_trade}\n{stop_mmo}\nManager sẽ dừng ngay.", True
 
         if command == "/status":
-            state = "RUNNING" if self._is_child_running() else "STOPPED"
-            pid = self.child_proc.pid if self._is_child_running() and self.child_proc else "-"
-            return f"Manager: RUNNING\nOpenClaw telegram: {state}\nPID: {pid}", False
+            trade_state = "RUNNING" if self._is_trade_running() else "STOPPED"
+            mmo_state = "RUNNING" if self._is_mmo_running() else "STOPPED"
+            trade_pid = self.trade_proc.pid if self._is_trade_running() and self.trade_proc else "-"
+            mmo_pid = self.mmo_proc.pid if self._is_mmo_running() and self.mmo_proc else "-"
+            return (
+                "Manager: RUNNING\n"
+                f"Trade telegram: {trade_state} | PID: {trade_pid}\n"
+                f"MMO telegram: {mmo_state} | PID: {mmo_pid}"
+            ), False
 
-        return "Lệnh không hợp lệ. Dùng /help để xem lệnh manager.", False
+        # Natural-language shell task fallback
+        shell_result = self._handle_shell_task(text)
+        if shell_result is not None:
+            return shell_result, False
 
-    def _poll_child_health(self) -> str | None:
-        if self.child_proc is None:
-            return None
-        code = self.child_proc.poll()
-        if code is None:
-            return None
-        self.child_proc = None
-        return f"OpenClaw telegram bot đã dừng (exit={code})."
+        return "Lệnh không hợp lệ. Dùng /help để xem lệnh.\nHoặc viết tự nhiên vd: 'tao script hello world' / 'down repo trade coin' / 'run myscript'", False
+
+    def _poll_children_health(self) -> list[str]:
+        messages: list[str] = []
+        if self.trade_proc is not None:
+            code = self.trade_proc.poll()
+            if code is not None:
+                self.trade_proc = None
+                messages.append(f"Trade telegram bot đã dừng (exit={code}).")
+        if self.mmo_proc is not None:
+            code = self.mmo_proc.poll()
+            if code is not None:
+                self.mmo_proc = None
+                messages.append(f"MMO telegram bot đã dừng (exit={code}).")
+        return messages
 
     def run(self) -> None:
         signal.signal(signal.SIGINT, self._shutdown_signal)
         signal.signal(signal.SIGTERM, self._shutdown_signal)
 
-        print("Manager đang chạy... chờ lệnh Telegram /start /stop /stop force", flush=True)
+        print("Manager đang chạy... chờ lệnh Telegram /start trade|mmo /stop trade|mmo", flush=True)
 
         if self.allowed_chat:
             try:
                 token_note = ""
-                if not self.child_token_override:
+                if not self.trade_token_override:
                     token_note = (
                         "\nLưu ý: manager và bot con đang dùng chung TELEGRAM_BOT_TOKEN. "
-                        "Nên cấu hình MANAGER_TELEGRAM_BOT_TOKEN + OPENCLAW_TELEGRAM_BOT_TOKEN để ổn định."
+                        "Nên cấu hình MANAGER_TELEGRAM_BOT_TOKEN + OPENCLAW_TELEGRAM_BOT_TOKEN + MMO_TELEGRAM_BOT_TOKEN để ổn định."
                     )
                 _send_message(
                     self.token,
                     self.allowed_chat,
                     (
                         f"Manager online trên {self.host}.\n"
-                        "Gửi /start để chạy OpenClaw telegram bot."
+                        "Gửi /start trade hoặc /start mmo để chạy bot con."
                         f"{token_note}"
                     ),
                 )
@@ -204,12 +380,12 @@ class OpenClawManager:
             self.offset = None
 
         while self.running:
-            child_msg = self._poll_child_health()
-            if child_msg and self.allowed_chat:
-                try:
-                    _send_message(self.token, self.allowed_chat, child_msg)
-                except Exception:
-                    pass
+            for child_msg in self._poll_children_health():
+                if self.allowed_chat:
+                    try:
+                        _send_message(self.token, self.allowed_chat, child_msg)
+                    except Exception:
+                        pass
 
             try:
                 payload = _get_updates(self.token, offset=self.offset)
@@ -238,8 +414,10 @@ class OpenClawManager:
                 print(f"Manager loop error: {exc}", flush=True)
                 time.sleep(self.poll_interval_sec)
 
-        if self._is_child_running():
-            self._stop_child()
+        if self._is_trade_running():
+            self._stop_bot("trade", close_positions=True)
+        if self._is_mmo_running():
+            self._stop_bot("mmo", close_positions=False)
 
         if self.allowed_chat:
             try:
