@@ -58,6 +58,11 @@ class OpenClawManager:
         self.trade_chat_override = os.getenv("OPENCLAW_TELEGRAM_ALLOWED_CHAT_ID", "").strip()
         self.mmo_token_override = os.getenv("MMO_TELEGRAM_BOT_TOKEN", "").strip()
         self.mmo_chat_override = os.getenv("MMO_TELEGRAM_ALLOWED_CHAT_ID", "").strip()
+        
+        # Conversational developer mode — multi-turn dialog
+        self.build_conversation_state = "IDLE"  # IDLE | ASKING_TASK | CONFIRMING_TASK | BUILDING
+        self.build_pending_description = ""  # temp storage for user description
+        self.build_pending_details = {}  # temp storage for task details
 
         if not self.token:
             raise RuntimeError("Thiếu TELEGRAM_BOT_TOKEN trong .env")
@@ -320,6 +325,167 @@ class OpenClawManager:
             + "\n\nGợi ý: dùng /code để xem code hiện tại rồi /command mô tả rõ hơn."
         )
 
+    def _handle_build_conversation(self, text: str) -> tuple[str, bool] | None:
+        """Handle multi-turn conversation during build mode.
+        Returns (reply, continue_running) if handled, else None.
+        
+        States:
+        - ASKING_TASK: waits for user to describe what they want
+        - CONFIRMING_TASK: waits for user confirmation before generating
+        """
+        if self.build_conversation_state == "IDLE":
+            return None
+        
+        stripped = text.strip().lower()
+        
+        # ASKING_TASK: user describes what they want
+        if self.build_conversation_state == "ASKING_TASK":
+            if not text.strip():
+                return "Vui lòng nhập mô tả công việc bạn muốn làm.", False
+            
+            self.build_pending_description = text.strip()
+            
+            # Determine task type and ask for details
+            task_type = self._infer_task_type(self.build_pending_description)
+            
+            if task_type == "web":
+                detail_msg = (
+                    f"📝 Bạn muốn tạo: **{self.build_pending_description}**\n\n"
+                    "Bạn muốn:\n"
+                    "• web nào? (web đơn giản, API server, webapp có database, ...)\n"
+                    "• cần tính năng gì? (login, upload file, real-time, ...)\n\n"
+                    "Gõ 'ok' để bắt đầu build ngay, hoặc thêm chi tiết."
+                )
+            elif task_type == "script":
+                detail_msg = (
+                    f"📝 Script: **{self.build_pending_description}**\n\n"
+                    "Chi tiết:\n"
+                    "• Input/output gì?\n"
+                    "• Các thư viện cần?\n\n"
+                    "Gõ 'ok' để bắt đầu, hoặc nói thêm chi tiết."
+                )
+            elif task_type == "api":
+                detail_msg = (
+                    f"📝 API: **{self.build_pending_description}**\n\n"
+                    "Bạn cần:\n"
+                    "• Endpoint nào?\n"
+                    "• Kiểu database nào?\n"
+                    "• Authentication?\n\n"
+                    "Gõ 'ok' để bắt đầu."
+                )
+            else:
+                detail_msg = (
+                    f"📝 Task: **{self.build_pending_description}**\n\n"
+                    "Gõ 'ok' để bắt đầu build ngay."
+                )
+            
+            self.build_conversation_state = "CONFIRMING_TASK"
+            return detail_msg, False
+        
+        # CONFIRMING_TASK: wait for ok/confirm or more details
+        if self.build_conversation_state == "CONFIRMING_TASK":
+            if stripped in {"ok", "yes", "yep", "chạy", "được", "ok được", "start"}:
+                # User confirmed — start building
+                self.build_conversation_state = "BUILDING"
+                return self._start_build_task(), False
+            elif stripped == "cancel" or stripped.startswith("/stop"):
+                # User cancelled
+                self.build_conversation_state = "IDLE"
+                return "Build cancelled. Gõ /start build để bắt đầu lại.", False
+            else:
+                # User adding more details
+                self.build_pending_description += "\n" + text.strip()
+                return (
+                    f"💬 Ghi nhận thêm: \"{text.strip()}\"\n"
+                    f"Mô tả hiện tại: {self.build_pending_description}\n\n"
+                    "Gõ 'ok' để bắt đầu build."
+                ), False
+        
+        return None
+    
+    def _infer_task_type(self, description: str) -> str:
+        """Guess task type from description."""
+        lower = description.lower()
+        if any(k in lower for k in ["web", "website", "flask", "django", "html", "frontend"]):
+            return "web"
+        if any(k in lower for k in ["api", "server", "endpoint", "rest"]):
+            return "api"
+        if any(k in lower for k in ["script", "tool", "scraper", "bot"]):
+            return "script"
+        return "generic"
+    
+    def _start_build_task(self) -> tuple[str, bool]:
+        """Generate code for the pending task."""
+        description = self.build_pending_description
+        if not description:
+            return "Không có mô tả. Hãy /start build lại.", False
+        
+        # Generate code
+        try:
+            _send_message(self.token, self.allowed_chat, "⏳ Giờ tôi đang build... vui lòng chờ")
+        except:
+            pass
+        
+        code, engine = generate_code(description)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        slug = slug_from_description(description)
+        gen_file = self.root_dir / f"gen_{ts}_{slug}.py"
+        gen_file.write_text(code, encoding="utf-8")
+        self.last_generated_file = gen_file
+        self.last_command_description = description
+        
+        # Run it
+        cmd = [sys.executable, str(gen_file)]
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=60, cwd=str(self.root_dir)
+            )
+            out = proc.stdout.strip() or "(no output)"
+            err = proc.stderr.strip() or ""
+            
+            # Report success/error
+            if proc.returncode == 0:
+                output_summary = out[:500] if len(out) < 500 else out[:500] + "..."
+                self.build_conversation_state = "IDLE"
+                return (
+                    f"✅ Build thành công!\n\n"
+                    f"📄 File: {gen_file.name}\n"
+                    f"🔧 Engine: [{engine}]\n"
+                    f"✨ Output:\n{output_summary}\n\n"
+                    f"Dùng /code để xem source, /run để chạy lại, /retry để sửa lỗi.\n"
+                    f"Gõ /stop build để tắt build mode."
+                ), False
+            else:
+                # Error
+                error_msg = err or out or "Unknown error"
+                self.build_conversation_state = "IDLE"
+                return (
+                    f"❌ Build có lỗi:\n\n{error_msg[:800]}\n\n"
+                    f"Dùng /retry để tự động sửa, hoặc /start build lại."
+                ), False
+        except subprocess.TimeoutExpired:
+            # Long-running app (web server) — timeout is expected
+            if self._is_expected_long_running(description, "", ""):
+                self.build_conversation_state = "IDLE"
+                port_hint = "5000" if "5000" in code else "3000"
+                return (
+                    f"✅ Build thành công - Server đã chạy!\n\n"
+                    f"📄 File: {gen_file.name}\n"
+                    f"🔧 Engine: [{engine}]\n"
+                    f"🌐 Truy cập: http://localhost:{port_hint} hoặc xem terminal.\n\n"
+                    f"Dùng /code để xem source, /stop build để dừng."
+                ), False
+            else:
+                self.build_conversation_state = "IDLE"
+                return (
+                    f"⏱️ Build timeout sau 60 giây.\n\n"
+                    f"📄 File: {gen_file.name}\n"
+                    f"Dùng /retry để tự động sửa, hoặc /code để xem source."
+                ), False
+        except Exception as exc:
+            self.build_conversation_state = "IDLE"
+            return f"❌ Lỗi khi build: {exc}", False
+
     def _handle_codegen(self, text: str) -> str | None:
         """Handle /command '<description>' or /retry — generate + save Python code via AI.
         - /command 'desc' → generate from desc
@@ -510,22 +676,25 @@ class OpenClawManager:
                 "Manager commands:\n"
                 "/start trade   → chạy trade telegram bot\n"
                 "/start mmo     → chạy mmo telegram bot\n"
-                "/start build   → bật AI coder mode\n"
+                "/start build   → bật AI coder + Developer mode (hỏi công việc)\n"
                 "/stop trade    → stop trade bot (kèm close all)\n"
                 "/stop mmo      → stop mmo bot\n"
-                "/stop build    → tắt AI coder mode\n"
+                "/stop build    → tắt build mode\n"
                 "/stop force    → stop tất cả + dừng manager\n"
                 "/status        → trạng thái processes\n"
-                f"\nAI Coder mode [{build_indicator}] (như developer trên máy):\n"
-                "/command 'viết script trade coin'   → AI sinh code + lưu\n"
-                "/command 'tạo 1 website bán hàng'   → AI sinh Flask app\n"
-                "/command retry hoặc /retry         → tự chạy + tự sửa theo lỗi\n"
-                "/run           → chạy file vừa được tạo, trả stdout\n"
-                "/code          → xem toàn bộ source file vừa tạo\n"
-                "\nShell tasks (viết tự nhiên):\n"
-                "  tao script 'hello world'  → tạo + chạy Python script\n"
-                "  down repo 'trade coin'    → clone GitHub repo\n"
-                "  run 'ten_file.py'         → chạy file có sẵn"
+                f"\n🤖 AI Coder mode [{build_indicator}] — Developer Bot (interactive):\n"
+                "  /start build           → Bot hỏi: 'Bạn muốn làm gì?'\n"
+                "  [gõ mô tả]             → Bot xác nhận + hỏi chi tiết\n"
+                "  ok / yes               → Bot build ngay, xem kết quả\n"
+                "  \n  Hoặc dùng truyền thống:\n"
+                "  /command 'viết script' → AI sinh code (không hỏi gì cả)\n"
+                "  /retry                 → Auto-fix lỗi + tự chạy\n"
+                "  /run                   → Chạy file, trả stdout\n"
+                "  /code                  → Xem full source\n"
+                "\n🛠️ Shell tasks (viết tự nhiên):\n"
+                "  tao script 'hello'     → tạo + chạy Python script\n"
+                "  down repo 'keyword'    → clone GitHub\n"
+                "  run 'file.py'          → chạy file có sẵn"
             ), False
 
         if command in {"/start", "/start trade"}:
@@ -536,9 +705,15 @@ class OpenClawManager:
 
         if command == "/start build":
             if self.build_mode:
-                return "Build mode đang bật rồi.", False
+                return "Build mode đang bật rồi. Gõ /stop build để tắt.", False
             self.build_mode = True
-            return "✅ Build mode ON — sẵn sàng cho /command 'mô tả'\nDùng /stop build để tắt hoặc /stop force để dừng tất cả.", False
+            self.build_conversation_state = "ASKING_TASK"
+            self.build_pending_description = ""
+            return (
+                "✅ Build mode ON — Developer mode active\n\n"
+                "🤖 Bạn muốn làm gì? (ví dụ: 'tôi làm 1 web đơn giản' hay 'script lấy data từ API')\n\n"
+                "Dùng /stop build để tắt build mode."
+            ), False
 
         if command == "/stop build":
             if not self.build_mode:
@@ -624,6 +799,12 @@ class OpenClawManager:
         shell_result = self._handle_shell_task(text)
         if shell_result is not None:
             return shell_result, False
+
+        # Check if in build conversation mode (multi-turn dialog)
+        if self.build_mode and self.build_conversation_state != "IDLE":
+            conv_result = self._handle_build_conversation(text)
+            if conv_result is not None:
+                return conv_result
 
         return "Lệnh không hợp lệ. Dùng /help để xem lệnh.\nHoặc viết tự nhiên vd: 'tao script hello world' / 'down repo trade coin' / 'run myscript'", False
 
