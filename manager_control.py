@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 
 from src.binance_trader import BinanceFuturesTrader
 from src.ai_coder import generate_code, generate_code_from_error, slug_from_description
+from src.ai_agent import classify_intent, chat_response, web_search
 
 
 load_dotenv()
@@ -68,6 +69,11 @@ class OpenClawManager:
         # Interactive process mode — keep a running process for user interaction
         self.interactive_process: subprocess.Popen[str] | None = None  # currently running interactive process
         self.process_is_interactive = False  # whether process expects stdin interaction
+
+        # AI Agent mode — always on, natural language understanding
+        self.agent_mode = True
+        self.conversation_history: list[dict[str, str]] = []  # last N messages for context
+        self.max_history = 10
 
         if not self.token:
             raise RuntimeError("Thiếu TELEGRAM_BOT_TOKEN trong .env")
@@ -866,35 +872,236 @@ class OpenClawManager:
         return None
 
     # ------------------------------------------------------------------
+    # AI Agent — ChatGPT-like natural language handler
+    # ------------------------------------------------------------------
+
+    def _add_to_history(self, role: str, content: str) -> None:
+        """Keep conversation history for context."""
+        self.conversation_history.append({"role": role, "content": content})
+        if len(self.conversation_history) > self.max_history:
+            self.conversation_history = self.conversation_history[-self.max_history:]
+
+    def _get_context_summary(self) -> str:
+        """Build context string for AI responses."""
+        parts = []
+        if self.last_generated_file:
+            parts.append(f"Last file: {self.last_generated_file.name}")
+        if self.last_command_description:
+            parts.append(f"Last task: {self.last_command_description}")
+        if self.interactive_process and self.interactive_process.poll() is None:
+            parts.append("Process dang chay")
+        if self.build_mode:
+            parts.append(f"Build mode: ON, state: {self.build_conversation_state}")
+        return " | ".join(parts) if parts else ""
+
+    def _handle_ai_message(self, text: str) -> tuple[str, bool]:
+        """AI Agent: understand user intent and act accordingly.
+        This is the ChatGPT-like brain that handles ANY natural language input.
+        Returns (reply, should_stop).
+        """
+        self._add_to_history("user", text)
+
+        # Classify user intent using Groq LLM
+        intent = classify_intent(text)
+        action = intent.get("action", "CHAT")
+        reply_text = intent.get("reply", "")
+        confidence = intent.get("confidence", 0.5)
+
+        # ---- SEARCH: user wants to search the web ----
+        if action == "SEARCH":
+            query = intent.get("query", "").strip() or text
+            try:
+                _send_message(self.token, self.allowed_chat, reply_text or f"Dang search: {query}...")
+            except:
+                pass
+            results = web_search(query)
+            final_reply = f"Ket qua search '{query}':\n\n{results[:2000]}"
+            self._add_to_history("assistant", final_reply)
+            return final_reply, False
+
+        # ---- BUILD: user wants to create code/project ----
+        if action == "BUILD":
+            description = intent.get("description", "").strip() or text
+            # Auto-enable build mode
+            if not self.build_mode:
+                self.build_mode = True
+
+            try:
+                _send_message(self.token, self.allowed_chat, reply_text or "OK, dang tao code cho ban...")
+            except:
+                pass
+
+            code, engine = generate_code(description)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            slug = slug_from_description(description)
+            gen_file = self.root_dir / f"gen_{ts}_{slug}.py"
+            gen_file.write_text(code, encoding="utf-8")
+            self.last_generated_file = gen_file
+            self.last_command_description = description
+
+            # Decide how to run: interactive, long-running, or normal
+            is_interactive = self._is_interactive_code(code, description)
+            is_long_running = self._is_expected_long_running(description, "", "")
+
+            if is_interactive:
+                initial_output, is_running = self._start_interactive_process(gen_file)
+                if is_running:
+                    final_reply = (
+                        f"Build thanh cong! Chuong trinh dang chay.\n\n"
+                        f"File: {gen_file.name}\n"
+                        f"Engine: [{engine}]\n"
+                        f"Output:\n{initial_output}\n\n"
+                        f"Go input cua ban (hoac /stop_process de dung):"
+                    )
+                else:
+                    final_reply = (
+                        f"Process da chay xong.\n\n"
+                        f"File: {gen_file.name}\n"
+                        f"Output:\n{initial_output[:800]}"
+                    )
+                self._add_to_history("assistant", final_reply)
+                return final_reply, False
+
+            if is_long_running:
+                try:
+                    cmd = [sys.executable, str(gen_file)]
+                    proc = subprocess.Popen(
+                        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True, cwd=str(self.root_dir),
+                    )
+                    self.interactive_process = proc
+                    port_hint = "5000" if "5000" in code else "3000"
+                    final_reply = (
+                        f"Build thanh cong - Server dang chay!\n\n"
+                        f"File: {gen_file.name}\n"
+                        f"Engine: [{engine}]\n"
+                        f"Truy cap: http://localhost:{port_hint}\n\n"
+                        f"Noi 'stop' de dung server."
+                    )
+                except Exception as exc:
+                    final_reply = f"Loi khi start server: {exc}"
+                self._add_to_history("assistant", final_reply)
+                return final_reply, False
+
+            # Normal execution
+            rc, out, err, timed_out = self._execute_file(gen_file, timeout_sec=60)
+            if rc == 0:
+                output = out[:1000] if out else "(no output)"
+                final_reply = (
+                    f"Build thanh cong!\n\n"
+                    f"File: {gen_file.name}\n"
+                    f"Engine: [{engine}]\n"
+                    f"Output:\n{output}\n\n"
+                    f"Noi 'fix' neu co loi, 'chay lai' de run lai, 'xem code' de xem source."
+                )
+            else:
+                error_msg = err or out or "Unknown error"
+                final_reply = (
+                    f"Build xong nhung co loi (exit={rc}):\n\n{error_msg[:800]}\n\n"
+                    f"File: {gen_file.name}\n"
+                    f"Noi 'fix' de toi tu sua loi."
+                )
+            self._add_to_history("assistant", final_reply)
+            return final_reply, False
+
+        # ---- RUN: user wants to run existing code ----
+        if action == "RUN":
+            if self.last_generated_file is None or not self.last_generated_file.exists():
+                return "Chua co file nao de chay. Hay noi toi muon tao gi truoc.", False
+            fp = self.last_generated_file
+            rc, out, err, timed_out = self._execute_file(fp, timeout_sec=60)
+            if rc == 0:
+                output = out[:1500] if out else "(no output)"
+                final_reply = f"Chay '{fp.name}' thanh cong:\n{output}"
+            else:
+                error_msg = err or out or "Unknown error"
+                final_reply = f"Chay '{fp.name}' bi loi (exit={rc}):\n{error_msg[:800]}\n\nNoi 'fix' de toi sua."
+            self._add_to_history("assistant", final_reply)
+            return final_reply, False
+
+        # ---- DEBUG: user reports error, wants fix ----
+        if action == "DEBUG":
+            result = self._auto_retry_until_success()
+            self._add_to_history("assistant", result)
+            return result, False
+
+        # ---- CONFIRM: user says ok/yes ----
+        if action == "CONFIRM":
+            # Check if there's a pending build conversation
+            if self.build_mode and self.build_conversation_state == "CONFIRMING_TASK":
+                conv_result = self._handle_build_conversation(text)
+                if conv_result is not None:
+                    reply_str = conv_result[0] if isinstance(conv_result, tuple) else conv_result
+                    return reply_str, False
+            # Check if last task can be re-run
+            if self.last_generated_file and self.last_generated_file.exists():
+                fp = self.last_generated_file
+                rc, out, err, timed_out = self._execute_file(fp, timeout_sec=60)
+                if rc == 0:
+                    return f"Chay lai '{fp.name}':\n{(out or '(no output)')[:1500]}", False
+                else:
+                    return f"Chay lai '{fp.name}' bi loi:\n{(err or out)[:800]}\n\nNoi 'fix' de sua.", False
+            return reply_text or "OK! Ban muon toi lam gi?", False
+
+        # ---- CANCEL: user wants to stop ----
+        if action == "CANCEL":
+            # Stop any running process
+            if self.interactive_process and self.interactive_process.poll() is None:
+                try:
+                    self.interactive_process.terminate()
+                    self.interactive_process.wait(timeout=2)
+                except:
+                    pass
+                self.interactive_process = None
+                self.process_is_interactive = False
+            self.build_conversation_state = "IDLE"
+            return reply_text or "Da dung. Ban muon lam gi tiep?", False
+
+        # ---- STATUS: user asks about system status ----
+        if action == "STATUS":
+            trade_state = "RUNNING" if self._is_trade_running() else "STOPPED"
+            mmo_state = "RUNNING" if self._is_mmo_running() else "STOPPED"
+            build_state = "ON" if self.build_mode else "OFF"
+            gen_file = self.last_generated_file.name if self.last_generated_file else "(none)"
+            proc_state = "RUNNING" if (self.interactive_process and self.interactive_process.poll() is None) else "STOPPED"
+            return (
+                f"Trang thai he thong:\n"
+                f"  Trade bot: {trade_state}\n"
+                f"  MMO bot: {mmo_state}\n"
+                f"  Build mode: {build_state}\n"
+                f"  Process: {proc_state}\n"
+                f"  Last file: {gen_file}"
+            ), False
+
+        # ---- CHAT: normal conversation, answer with AI ----
+        context = self._get_context_summary()
+        ai_reply = chat_response(text, context)
+        self._add_to_history("assistant", ai_reply)
+        return ai_reply, False
+
+    # ------------------------------------------------------------------
 
     def _handle_command(self, text: str) -> tuple[str, bool]:
         command = text.strip().lower()
 
         if command in {"/help", "/start manager", "/manager"}:
-            build_indicator = "✓ ON" if self.build_mode else "(off)"
             return (
-                "Manager commands:\n"
-                "/start trade   → chạy trade telegram bot\n"
-                "/start mmo     → chạy mmo telegram bot\n"
-                "/start build   → bật AI coder + Developer mode (hỏi công việc)\n"
-                "/stop trade    → stop trade bot (kèm close all)\n"
-                "/stop mmo      → stop mmo bot\n"
-                "/stop build    → tắt build mode\n"
-                "/stop force    → stop tất cả + dừng manager\n"
-                "/status        → trạng thái processes\n"
-                f"\n🤖 AI Coder mode [{build_indicator}] — Developer Bot (interactive):\n"
-                "  /start build           → Bot hỏi: 'Bạn muốn làm gì?'\n"
-                "  [gõ mô tả]             → Bot xác nhận + hỏi chi tiết\n"
-                "  ok / yes               → Bot build ngay, xem kết quả\n"
-                "  \n  Hoặc dùng truyền thống:\n"
-                "  /command 'viết script' → AI sinh code (không hỏi gì cả)\n"
-                "  /retry                 → Auto-fix lỗi + tự chạy\n"
-                "  /run                   → Chạy file, trả stdout\n"
-                "  /code                  → Xem full source\n"
-                "\n🛠️ Shell tasks (viết tự nhiên):\n"
-                "  tao script 'hello'     → tạo + chạy Python script\n"
-                "  down repo 'keyword'    → clone GitHub\n"
-                "  run 'file.py'          → chạy file có sẵn"
+                "AI Agent Bot - Noi chuyen tu nhien nhu ChatGPT!\n\n"
+                "Go bat ky gi ban muon:\n"
+                "  'tao 1 website ban hang'\n"
+                "  'search google ve bitcoin'\n"
+                "  'chay lai code'\n"
+                "  'bi loi roi, fix ho toi'\n"
+                "  'hom nay troi dep qua' (chat binh thuong)\n"
+                "\nSlash commands (optional):\n"
+                "  /start trade|mmo|build  - start bot/mode\n"
+                "  /stop trade|mmo|build   - stop bot/mode\n"
+                "  /status                 - trang thai\n"
+                "  /retry                  - auto-fix loi\n"
+                "  /run                    - chay file\n"
+                "  /code                   - xem source\n"
+                "  /command 'mo ta'        - tao code truc tiep\n"
+                "  /help                   - hien menu nay"
             ), False
 
         if command in {"/start", "/start trade"}:
@@ -995,18 +1202,9 @@ class OpenClawManager:
                 src = src[:3800] + f"\n... (truncated, full file: {fp.name})"
             return f"--- {fp.name} ---\n{src}", False
 
-        # Natural-language shell task fallback
-        shell_result = self._handle_shell_task(text)
-        if shell_result is not None:
-            return shell_result, False
-
-        # Check if in build conversation mode (multi-turn dialog)
-        if self.build_mode and self.build_conversation_state != "IDLE":
-            conv_result = self._handle_build_conversation(text)
-            if conv_result is not None:
-                return conv_result
-
-        return "Lệnh không hợp lệ. Dùng /help để xem lệnh.\nHoặc viết tự nhiên vd: 'tao script hello world' / 'down repo trade coin' / 'run myscript'", False
+        # --- AI Agent: route ALL non-command text through AI ---
+        # (build conversation, shell tasks, search, chat — all handled by AI agent)
+        return self._handle_ai_message(text)
 
     def _poll_children_health(self) -> list[str]:
         messages: list[str] = []
@@ -1040,8 +1238,10 @@ class OpenClawManager:
                     self.token,
                     self.allowed_chat,
                     (
-                        f"Manager online trên {self.host}.\n"
-                        "Gửi /start trade hoặc /start mmo để chạy bot con."
+                        f"AI Agent online tren {self.host}.\n"
+                        "Go bat ky gi ban muon - toi hieu tieng Viet!\n"
+                        "Vi du: 'tao web ban hang', 'search bitcoin', 'hom nay troi dep qua'\n"
+                        "/help de xem menu."
                         f"{token_note}"
                     ),
                 )
@@ -1081,14 +1281,11 @@ class OpenClawManager:
                         _send_message(self.token, chat_id, "Unauthorized chat id")
                         continue
 
-                    reply, should_stop_manager = self._handle_command(text)
-                    # Check if there's an interactive process running first
+                    # Priority 1: Interactive process gets non-command input
                     if self.interactive_process and self.interactive_process.poll() is None and not text.lower().startswith("/"):
-                        # User input to interactive process (not a command)
                         reply = self._send_to_interactive_process(text)
                         should_stop_manager = False
                     elif text.strip().lower() == "/stop_process":
-                        # User wants to stop the running process
                         if self.interactive_process:
                             try:
                                 self.interactive_process.terminate()
@@ -1102,7 +1299,10 @@ class OpenClawManager:
                             reply = "No process running."
                         should_stop_manager = False
                     else:
+                        # Priority 2: All messages go through _handle_command
+                        # (which handles /commands first, then falls through to AI agent)
                         reply, should_stop_manager = self._handle_command(text)
+
                     _send_message(self.token, chat_id, reply)
                     if should_stop_manager:
                         break
