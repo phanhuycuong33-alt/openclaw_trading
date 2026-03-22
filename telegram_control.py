@@ -14,7 +14,13 @@ from src.config import load_settings
 from src.binance_trader import BinanceFuturesTrader
 from src.claude_client import review_positions_with_claude
 from src.ecommerce_scanner import run_sell_scan
-from src.job_scanner import format_searchjob_report, search_remote_jobs
+from src.job_scanner import (
+    format_searchjob_auto_alert,
+    format_searchjob_report,
+    format_verification_required_alert,
+    get_searchjob_auto_scan_interval_sec,
+    search_remote_jobs,
+)
 from src.mmo_research import (
     fetch_affiliate_payout_status,
     format_mmo_auto_alert,
@@ -1377,6 +1383,58 @@ def _run_mmo_auto_loop(token: str, chat_id: str, stop_event: threading.Event) ->
     _send_message(token, chat_id, "MMO auto đã dừng.")
 
 
+def _run_searchjob_auto_loop(
+    token: str,
+    chat_id: str,
+    stop_event: threading.Event,
+    keyword: str,
+) -> None:
+    scan_interval_sec = get_searchjob_auto_scan_interval_sec()
+    seen_urls: set[str] = set()
+    verification_notified_companies: set[str] = set()
+
+    _send_message(
+        token,
+        chat_id,
+        (
+            "Job auto đã bật. "
+            f"Keyword={keyword or 'all'} | Scan mỗi {scan_interval_sec}s. "
+            "Khi job mới xuất hiện, bot sẽ báo ngay."
+        ),
+    )
+
+    while not stop_event.is_set():
+        try:
+            output = search_remote_jobs(keyword=keyword, limit=20)
+            jobs = output.get("jobs", []) if isinstance(output, dict) else []
+
+            new_jobs: list[dict[str, str]] = []
+            for job in jobs:
+                url = str(job.get("url") or "").strip()
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                new_jobs.append(job)
+
+            if new_jobs:
+                _send_message(token, chat_id, format_searchjob_auto_alert(keyword, new_jobs))
+
+                for job in new_jobs[:2]:
+                    company_key = str(job.get("company") or "").strip().lower()
+                    if company_key and company_key not in verification_notified_companies:
+                        _send_message(token, chat_id, format_verification_required_alert(job))
+                        verification_notified_companies.add(company_key)
+        except Exception as exc:
+            _send_message(token, chat_id, f"Searchjob auto loop lỗi: {exc}")
+
+        remaining = scan_interval_sec
+        while remaining > 0 and not stop_event.is_set():
+            time.sleep(1)
+            remaining -= 1
+
+    _send_message(token, chat_id, "Searchjob auto đã dừng.")
+
+
 def _handle_command(text: str) -> tuple[str, bool, dict[str, Any] | None, bool]:
     command = text.strip().lower()
 
@@ -1386,6 +1444,7 @@ def _handle_command(text: str) -> tuple[str, bool, dict[str, Any] | None, bool]:
             "/trade hoặc /trade <target_usdt> [review_after_sec] [leverage] (multi-coin cycle)\n"
             "/sell hoặc /sell <keyword1,keyword2> (scan sản phẩm e-commerce)\n"
             "/searchjob hoặc /searchjob <keyword> (tìm job remote)\n"
+            "/searchjob auto [keyword] | /searchjob stop | /searchjob status\n"
             "/mmo | /mmo auto | /mmo stop | /mmo start | /mmo steps | /mmo status | /mmo withdraw\n"
             "/run openclaw trading (single trade)\n"
             "/status\n/aiusage\n/stop"
@@ -1433,8 +1492,9 @@ def _handle_command(text: str) -> tuple[str, bool, dict[str, Any] | None, bool]:
     if command == "/trade":
         return "Đang khởi động chế độ multi-coin cycle...", False, None, False
 
-    return "Lệnh không hợp lệ. Dùng /trade, /sell, /searchjob, /mmo hoặc /run openclaw trading", False, None, False
-
+    return (
+        "Lệnh không hợp lệ. Dùng /trade, /sell, /searchjob, /searchjob auto, /mmo hoặc /run openclaw trading"
+    ), False, None, False
 
 def run_telegram_bot() -> None:
     settings = load_settings()
@@ -1452,6 +1512,9 @@ def run_telegram_bot() -> None:
     cycle_thread: threading.Thread | None = None
     mmo_auto_stop_event = threading.Event()
     mmo_auto_thread: threading.Thread | None = None
+    searchjob_auto_stop_event = threading.Event()
+    searchjob_auto_thread: threading.Thread | None = None
+    searchjob_auto_keyword = ""
 
     print(f"[CONFIG] DRY_RUN={settings.dry_run}, AUTO_REENTER={settings.auto_reenter_on_profit}", flush=True)
 
@@ -1587,6 +1650,50 @@ def run_telegram_bot() -> None:
                             _send_message(token, chat_id, f"✅ Multi-coin cycle đã bắt đầu với target {target_usdt:.4f} USDT.")
                             continue
 
+                        if normalized_text.startswith("/searchjob auto"):
+                            if searchjob_auto_thread is not None and searchjob_auto_thread.is_alive():
+                                _send_message(token, chat_id, "Searchjob auto đang chạy. Dùng /searchjob stop để dừng.")
+                                continue
+
+                            searchjob_parts = text.strip().split(maxsplit=2)
+                            searchjob_auto_keyword = searchjob_parts[2].strip() if len(searchjob_parts) == 3 else ""
+
+                            searchjob_auto_stop_event.clear()
+                            searchjob_auto_thread = threading.Thread(
+                                target=_run_searchjob_auto_loop,
+                                args=(token, chat_id, searchjob_auto_stop_event, searchjob_auto_keyword),
+                                daemon=True,
+                            )
+                            searchjob_auto_thread.start()
+                            _send_message(
+                                token,
+                                chat_id,
+                                (
+                                    "✅ Đã bật Searchjob auto. "
+                                    f"Keyword={searchjob_auto_keyword or 'all'}. "
+                                    "Bot sẽ inform khi có job mới + khi cần verify account."
+                                ),
+                            )
+                            continue
+
+                        if normalized_text == "/searchjob stop":
+                            if searchjob_auto_thread is None or not searchjob_auto_thread.is_alive():
+                                _send_message(token, chat_id, "Searchjob auto hiện không chạy.")
+                                continue
+                            searchjob_auto_stop_event.set()
+                            _send_message(token, chat_id, "⏹ Đang dừng Searchjob auto...")
+                            continue
+
+                        if normalized_text == "/searchjob status":
+                            is_running = searchjob_auto_thread is not None and searchjob_auto_thread.is_alive()
+                            status_text = "đang chạy" if is_running else "đang tắt"
+                            _send_message(
+                                token,
+                                chat_id,
+                                f"Searchjob auto {status_text}. Keyword={searchjob_auto_keyword or 'all'}.",
+                            )
+                            continue
+
                         if normalized_text == "/mmo auto":
                             if mmo_auto_thread is not None and mmo_auto_thread.is_alive():
                                 _send_message(token, chat_id, "MMO auto đang chạy. Dùng /mmo stop để dừng.")
@@ -1661,12 +1768,15 @@ def run_telegram_bot() -> None:
     finally:
         stop_event.set()
         mmo_auto_stop_event.set()
+        searchjob_auto_stop_event.set()
         for thread in refresh_threads:
             thread.join(timeout=2)
         if cycle_thread is not None:
             cycle_thread.join(timeout=2)
         if mmo_auto_thread is not None:
             mmo_auto_thread.join(timeout=2)
+        if searchjob_auto_thread is not None:
+            searchjob_auto_thread.join(timeout=2)
         if allowed_chat:
             try:
                 _send_message(token, allowed_chat, f"OpenClaw bot offline trên {host}.")

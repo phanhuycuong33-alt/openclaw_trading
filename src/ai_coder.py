@@ -38,7 +38,7 @@ def generate_code(description: str) -> tuple[str, str]:
     if groq_key:
         code, ok = _generate_with_groq(description, groq_key)
         if ok:
-            return code, "groq/llama3-70b-8192"
+            return code, "groq/llama-3.3-70b"
 
     # 3) Smart template fallback
     code = _smart_template(description)
@@ -68,7 +68,7 @@ def generate_code_from_error(
     if groq_key:
         code, ok = _repair_with_groq(description, previous_code, error_output, groq_key)
         if ok:
-            return code, "groq/repair"
+            return code, "groq/llama-3.1-70b/repair"
 
     # 3) Rule-based repair fallback
     repaired = _rule_based_repair(description, previous_code, error_output)
@@ -161,8 +161,8 @@ def _repair_with_claude(
 def _generate_with_groq(description: str, groq_key: str) -> tuple[str, bool]:
     try:
         import requests  # type: ignore
-        # Note: Groq models change frequently, try mixtral (stable) then fallback
-        model = "mixtral-8x7b-32768"
+        # Note: Groq models change frequently; using llama-3.3-70b-versatile
+        model = "llama-3.3-70b-versatile"
         payload = {
             "model": model,
             "messages": [

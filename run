@@ -24,7 +24,7 @@ fi
 if [[ "$first" != "openclaw" ]]; then
   echo "Usage: ./run openclaw [analysis|trading|telegram]"
   echo "       ./run manager openclaw"
-  echo "Manager env (optional): MANAGER_TELEGRAM_BOT_TOKEN, OPENCLAW_TELEGRAM_BOT_TOKEN"
+  echo "Manager env (optional): MANAGER_TELEGRAM_BOT_TOKEN, OPENCLAW_TELEGRAM_BOT_TOKEN, MMO_TELEGRAM_BOT_TOKEN"
   exit 1
 fi
 
@@ -41,7 +41,7 @@ case "$second" in
   *)
     echo "Usage: ./run openclaw [analysis|trading|telegram]"
     echo "       ./run manager openclaw"
-    echo "Manager env (optional): MANAGER_TELEGRAM_BOT_TOKEN, OPENCLAW_TELEGRAM_BOT_TOKEN"
+    echo "Manager env (optional): MANAGER_TELEGRAM_BOT_TOKEN, OPENCLAW_TELEGRAM_BOT_TOKEN, MMO_TELEGRAM_BOT_TOKEN"
     exit 1
     ;;
 esac
