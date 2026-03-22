@@ -53,6 +53,7 @@ class OpenClawManager:
         self.host = socket.gethostname()
         self.root_dir = Path(__file__).resolve().parent
         self.last_generated_file: Path | None = None  # last file from /command
+        self.last_command_description: str | None = None  # for /command retry
         self.trade_token_override = os.getenv("OPENCLAW_TELEGRAM_BOT_TOKEN", "").strip()
         self.trade_chat_override = os.getenv("OPENCLAW_TELEGRAM_ALLOWED_CHAT_ID", "").strip()
         self.mmo_token_override = os.getenv("MMO_TELEGRAM_BOT_TOKEN", "").strip()
@@ -177,49 +178,74 @@ class OpenClawManager:
     # ------------------------------------------------------------------
 
     def _handle_codegen(self, text: str) -> str | None:
-        """Handle /command '<description>' — generate + save Python code via AI.
-        Returns reply string, or None if text doesn't start with /command.
+        """Handle /command '<description>' or /retry — generate + save Python code via AI.
+        - /command 'desc' → generate from desc
+        - /command retry → regenerate from last description
+        - /retry → same as /command retry
+        Returns reply string, or None if text doesn't match patterns.
         """
         stripped = text.strip()
-        if not re.match(r"(?i)^/command\b", stripped):
+        
+        # Check if it's /retry or /command
+        is_retry = re.match(r"(?i)^/retry\b", stripped)
+        is_command = re.match(r"(?i)^/command\b", stripped)
+        
+        if not is_retry and not is_command:
             return None
-
-        # Extract description from the rest of the line (with or without quotes)
-        rest = re.sub(r"(?i)^/command\s*", "", stripped).strip()
-        description = rest.strip("'\"")
-        if not description:
-            return (
-                "Cú pháp: /command 'mô tả dự án'\n"
-                "Ví dụ  : /command 'viết script trade coin dùng Binance API'"
-            )
-
-        # Tell user we're working
+        
+        # Extract description
+        if is_retry:
+            # /retry → use last description
+            if self.last_command_description is None:
+                return "Không có description trước đó để retry. Dùng /command 'mô tả' trước."
+            description = self.last_command_description
+        else:
+            # /command <text>
+            rest = re.sub(r"(?i)^/command\s*", "", stripped).strip()
+            description = rest.strip("'\"")
+            
+            # Check for /command retry
+            if description.lower() == "retry":
+                if self.last_command_description is None:
+                    return "Không có description trước đó để retry. Dùng /command 'mô tả' trước."
+                description = self.last_command_description
+            elif not description:
+                return (
+                    "Cú pháp: /command 'mô tả dự án'\n"
+                    "         /command retry (sinh lại từ description cuối)\n"
+                    "         /retry (shortcut)\n"
+                    "Ví dụ  : /command 'viết script trade coin dùng Binance API'"
+                )
+        
+        # Generate code
         slug = slug_from_description(description)
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"gen_{ts}_{slug}.py"
         out_path = self.root_dir / filename
-
+        
         try:
             code, engine = generate_code(description)
         except Exception as exc:
             return f"Lỗi khi sinh code: {exc}"
-
+        
+        # Save file and description
         out_path.write_text(code, encoding="utf-8")
         self.last_generated_file = out_path
-
-        # Preview first 25 lines
-        lines = code.splitlines()
-        preview_lines = lines[:25]
+        self.last_command_description = description
+        
+        # Show preview
+        lines_code = code.splitlines()
+        preview_lines = lines_code[:25]
         preview = "\n".join(preview_lines)
-        if len(lines) > 25:
-            preview += f"\n... (+{len(lines)-25} dòng nữa)"
-
+        if len(lines_code) > 25:
+            preview += f"\n... (+{len(lines_code)-25} dòng nữa)"
+        
         return (
             f"✅ [{engine}] Đã tạo: {filename}\n"
             f"Mô tả: {description}\n\n"
             f"--- Preview ---\n"
             f"{preview}\n\n"
-            f"Dùng /run để chạy | /code để xem toàn bộ"
+            f"Dùng /run để chạy | /code để xem toàn bộ | /retry để sinh lại"
         )
 
     # ------------------------------------------------------------------
@@ -444,6 +470,15 @@ class OpenClawManager:
             if len(src) > 3800:
                 src = src[:3800] + f"\n... (truncated, full file: {fp.name})"
             return f"--- {fp.name} ---\n{src}", False
+
+        # /retry shortcut — same as /command retry
+        if command == "/retry":
+            if not self.build_mode:
+                return "❌ Build mode OFF. Dùng /start build trước.", False
+            codegen_result = self._handle_codegen("/retry")  # Pass /retry directly
+            if codegen_result is not None:
+                return codegen_result, False
+            return "Lỗi khi retry.", False
 
         # Natural-language shell task fallback
         shell_result = self._handle_shell_task(text)
