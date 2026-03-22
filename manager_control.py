@@ -16,7 +16,7 @@ import requests
 from dotenv import load_dotenv
 
 from src.binance_trader import BinanceFuturesTrader
-from src.ai_coder import generate_code, slug_from_description
+from src.ai_coder import generate_code, generate_code_from_error, slug_from_description
 
 
 load_dotenv()
@@ -177,6 +177,149 @@ class OpenClawManager:
     # AI code generator  (/command ... /run /code)
     # ------------------------------------------------------------------
 
+    def _execute_file(self, file_path: Path, timeout_sec: int = 60) -> tuple[int, str, str, bool]:
+        cmd = [sys.executable, str(file_path)] if file_path.suffix == ".py" else ["bash", str(file_path)]
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+                cwd=str(self.root_dir),
+            )
+            return proc.returncode, proc.stdout.strip(), proc.stderr.strip(), False
+        except subprocess.TimeoutExpired as exc:
+            out = (exc.stdout or "").strip() if isinstance(exc.stdout, str) else ""
+            err = (exc.stderr or "").strip() if isinstance(exc.stderr, str) else ""
+            return 124, out, err or f"Timeout sau {timeout_sec} giây", True
+        except Exception as exc:
+            return 1, "", str(exc), False
+
+    def _extract_missing_module(self, error_output: str) -> str | None:
+        m = re.search(r"No module named ['\"]([^'\"]+)['\"]", error_output)
+        if not m:
+            return None
+        return m.group(1).strip()
+
+    def _is_expected_long_running(self, description: str, out: str, err: str) -> bool:
+        low_desc = description.lower()
+        low_out = (out or "").lower()
+        low_err = (err or "").lower()
+        app_like = any(k in low_desc for k in ["website", "web", "server", "flask", "api"])
+        if app_like:
+            # Các app web/server thường chạy liên tục; timeout khi run test là bình thường.
+            return True
+        started_hint = any(
+            k in (low_out + "\n" + low_err)
+            for k in ["starting server", "running on", "serving", "http://", "0.0.0.0"]
+        )
+        return app_like and started_hint
+
+    def _auto_install_missing_module(self, module_name: str) -> tuple[bool, str]:
+        package_map = {
+            "flask": "flask",
+            "bs4": "beautifulsoup4",
+            "pandas": "pandas",
+            "numpy": "numpy",
+            "requests": "requests",
+            "ta": "ta",
+        }
+        package_name = package_map.get(module_name)
+        if not package_name:
+            return False, f"Không có mapping package cho module '{module_name}'."
+
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "pip", "install", package_name],
+                capture_output=True,
+                text=True,
+                timeout=180,
+                cwd=str(self.root_dir),
+            )
+            if proc.returncode == 0:
+                return True, f"Đã cài package '{package_name}' cho module '{module_name}'."
+            combined = (proc.stdout + "\n" + proc.stderr).strip()
+            return False, f"Cài package '{package_name}' thất bại: {combined[:400]}"
+        except Exception as exc:
+            return False, f"Lỗi cài package '{package_name}': {exc}"
+
+    def _auto_retry_until_success(self) -> str:
+        if self.last_generated_file is None or not self.last_generated_file.exists():
+            return "Chưa có file để retry. Dùng /command 'mô tả' trước."
+        if not self.last_command_description:
+            return "Chưa có description trước đó để retry. Dùng /command 'mô tả' trước."
+
+        max_attempts = max(1, int(os.getenv("BUILD_RETRY_MAX_ATTEMPTS", "3")))
+        description = self.last_command_description
+        current_file = self.last_generated_file
+        logs: list[str] = []
+
+        for attempt in range(1, max_attempts + 1):
+            code, out, err, timed_out = self._execute_file(current_file, timeout_sec=60)
+            if code == 0:
+                output = out or "(no stdout)"
+                logs.append(f"Attempt {attempt}: ✅ chạy thành công {current_file.name}")
+                return (
+                    "✅ Auto-retry thành công.\n"
+                    f"File: {current_file.name}\n"
+                    + "\n".join(logs)
+                    + f"\n\nOutput:\n{output[:1500]}"
+                )
+
+            if timed_out and self._is_expected_long_running(description, out, err):
+                logs.append(f"Attempt {attempt}: ✅ app chạy dạng long-running ({current_file.name})")
+                output = out or err or "Server started (timeout expected for long-running app)."
+                return (
+                    "✅ Auto-retry thành công (server đã khởi động, timeout là bình thường).\n"
+                    f"File: {current_file.name}\n"
+                    + "\n".join(logs)
+                    + f"\n\nOutput:\n{output[:1500]}"
+                )
+
+            runtime_error = err or out or "Unknown runtime error"
+            logs.append(f"Attempt {attempt}: ❌ {current_file.name} exit={code}")
+
+            if timed_out:
+                logs.append("  - Lỗi timeout, sẽ thử sửa code để giảm tác vụ dài.")
+
+            missing_module = self._extract_missing_module(runtime_error)
+            if missing_module:
+                ok_install, install_msg = self._auto_install_missing_module(missing_module)
+                logs.append(f"  - {install_msg}")
+                if ok_install:
+                    rerun_code, rerun_out, rerun_err, _ = self._execute_file(current_file, timeout_sec=60)
+                    if rerun_code == 0:
+                        output = rerun_out or "(no stdout)"
+                        logs.append("  - ✅ Sau khi cài package, script chạy OK.")
+                        return (
+                            "✅ Auto-retry thành công (fix bằng auto-install package).\n"
+                            f"File: {current_file.name}\n"
+                            + "\n".join(logs)
+                            + f"\n\nOutput:\n{output[:1500]}"
+                        )
+                    runtime_error = rerun_err or rerun_out or runtime_error
+
+            try:
+                previous_code = current_file.read_text(encoding="utf-8")
+            except Exception:
+                previous_code = ""
+
+            fixed_code, engine = generate_code_from_error(description, previous_code, runtime_error)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            slug = slug_from_description(description)
+            fixed_file = self.root_dir / f"gen_{ts}_{slug}_fix{attempt}.py"
+            fixed_file.write_text(fixed_code, encoding="utf-8")
+            self.last_generated_file = fixed_file
+            current_file = fixed_file
+            logs.append(f"  - Đã sinh bản sửa bằng [{engine}] -> {fixed_file.name}")
+
+        return (
+            "❌ Auto-retry chưa sửa được hoàn toàn sau tối đa số lần thử.\n"
+            f"File cuối: {self.last_generated_file.name if self.last_generated_file else '(none)'}\n"
+            + "\n".join(logs)
+            + "\n\nGợi ý: dùng /code để xem code hiện tại rồi /command mô tả rõ hơn."
+        )
+
     def _handle_codegen(self, text: str) -> str | None:
         """Handle /command '<description>' or /retry — generate + save Python code via AI.
         - /command 'desc' → generate from desc
@@ -212,8 +355,8 @@ class OpenClawManager:
             elif not description:
                 return (
                     "Cú pháp: /command 'mô tả dự án'\n"
-                    "         /command retry (sinh lại từ description cuối)\n"
-                    "         /retry (shortcut)\n"
+                    "         /command retry (tự chạy + tự sửa đến khi ổn hơn)\n"
+                    "         /retry (shortcut auto-fix)\n"
                     "Ví dụ  : /command 'viết script trade coin dùng Binance API'"
                 )
         
@@ -245,7 +388,7 @@ class OpenClawManager:
             f"Mô tả: {description}\n\n"
             f"--- Preview ---\n"
             f"{preview}\n\n"
-            f"Dùng /run để chạy | /code để xem toàn bộ | /retry để sinh lại"
+            f"Dùng /run để chạy | /code để xem toàn bộ | /retry để auto-fix"
         )
 
     # ------------------------------------------------------------------
@@ -376,6 +519,7 @@ class OpenClawManager:
                 f"\nAI Coder mode [{build_indicator}] (như developer trên máy):\n"
                 "/command 'viết script trade coin'   → AI sinh code + lưu\n"
                 "/command 'tạo 1 website bán hàng'   → AI sinh Flask app\n"
+                "/command retry hoặc /retry         → tự chạy + tự sửa theo lỗi\n"
                 "/run           → chạy file vừa được tạo, trả stdout\n"
                 "/code          → xem toàn bộ source file vừa tạo\n"
                 "\nShell tasks (viết tự nhiên):\n"
@@ -430,6 +574,11 @@ class OpenClawManager:
                 f"Last generated: {gen_file}"
             ), False
 
+        if command == "/retry" or re.match(r"(?i)^/command\s+retry\s*$", text.strip()):
+            if not self.build_mode:
+                return "❌ Build mode OFF. Dùng /start build trước.", False
+            return self._auto_retry_until_success(), False
+
         # AI code generator: /command '<description>'
         codegen_result = self._handle_codegen(text)
         if codegen_result is not None:
@@ -470,15 +619,6 @@ class OpenClawManager:
             if len(src) > 3800:
                 src = src[:3800] + f"\n... (truncated, full file: {fp.name})"
             return f"--- {fp.name} ---\n{src}", False
-
-        # /retry shortcut — same as /command retry
-        if command == "/retry":
-            if not self.build_mode:
-                return "❌ Build mode OFF. Dùng /start build trước.", False
-            codegen_result = self._handle_codegen("/retry")  # Pass /retry directly
-            if codegen_result is not None:
-                return codegen_result, False
-            return "Lỗi khi retry.", False
 
         # Natural-language shell task fallback
         shell_result = self._handle_shell_task(text)

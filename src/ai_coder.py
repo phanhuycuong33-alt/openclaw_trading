@@ -45,6 +45,36 @@ def generate_code(description: str) -> tuple[str, str]:
     return code, "template"
 
 
+def generate_code_from_error(
+    description: str,
+    previous_code: str,
+    error_output: str,
+) -> tuple[str, str]:
+    """Regenerate code by incorporating runtime error feedback.
+
+    Returns (python_source, engine_info).
+    """
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    model = os.getenv("MODEL", "claude-3-5-sonnet-20241022").strip()
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+
+    # 1) Claude repair pass
+    if api_key and api_key != "your_claude_api_key_here":
+        code, ok = _repair_with_claude(description, previous_code, error_output, api_key, model)
+        if ok:
+            return code, f"{model}/repair"
+
+    # 2) Groq repair pass
+    if groq_key:
+        code, ok = _repair_with_groq(description, previous_code, error_output, groq_key)
+        if ok:
+            return code, "groq/repair"
+
+    # 3) Rule-based repair fallback
+    repaired = _rule_based_repair(description, previous_code, error_output)
+    return repaired, "template/repair"
+
+
 # ---------------------------------------------------------------------------
 # Anthropic Claude
 # ---------------------------------------------------------------------------
@@ -84,6 +114,46 @@ def _generate_with_claude(description: str, api_key: str, model: str) -> tuple[s
         return "", False
 
 
+def _repair_with_claude(
+    description: str,
+    previous_code: str,
+    error_output: str,
+    api_key: str,
+    model: str,
+) -> tuple[str, bool]:
+    try:
+        from anthropic import Anthropic  # type: ignore
+
+        client = Anthropic(api_key=api_key)
+        prompt = (
+            "Hãy sửa script Python bị lỗi runtime.\n"
+            "Yêu cầu:\n"
+            "- Chỉ trả về code Python đã sửa, không markdown, không giải thích.\n"
+            "- Giữ mục tiêu gốc theo mô tả người dùng.\n"
+            "- Ưu tiên code chạy được ngay trong môi trường local.\n"
+            "- Nếu lỗi do thiếu package, hãy sửa code để có fallback an toàn hoặc giảm phụ thuộc ngoài.\n\n"
+            f"Mô tả dự án:\n{description}\n\n"
+            f"Lỗi runtime:\n{error_output[:3000]}\n\n"
+            f"Code cũ:\n{previous_code[:12000]}"
+        )
+
+        message = client.messages.create(
+            model=model,
+            max_tokens=2400,
+            temperature=0.1,
+            system=_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        parts = [getattr(b, "text", "") for b in message.content if getattr(b, "text", "")]
+        raw = "\n".join(parts).strip()
+        code = _strip_markdown(raw)
+        if "def " in code or "import " in code or "print(" in code:
+            return code, True
+        return "", False
+    except Exception:
+        return "", False
+
+
 # ---------------------------------------------------------------------------
 # Groq free API (OpenAI-compatible)
 # ---------------------------------------------------------------------------
@@ -101,6 +171,48 @@ def _generate_with_groq(description: str, groq_key: str) -> tuple[str, bool]:
             ],
             "temperature": 0.2,
             "max_tokens": 2000,
+        }
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        code = _strip_markdown(raw)
+        if "def " in code or "import " in code or "print(" in code:
+            return code, True
+        return "", False
+    except Exception:
+        return "", False
+
+
+def _repair_with_groq(
+    description: str,
+    previous_code: str,
+    error_output: str,
+    groq_key: str,
+) -> tuple[str, bool]:
+    try:
+        import requests  # type: ignore
+
+        payload = {
+            "model": "mixtral-8x7b-32768",
+            "messages": [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        "Sửa script Python bị lỗi runtime. Chỉ trả về code đã sửa.\n\n"
+                        f"Mô tả:\n{description}\n\n"
+                        f"Lỗi:\n{error_output[:3000]}\n\n"
+                        f"Code cũ:\n{previous_code[:12000]}"
+                    ),
+                },
+            ],
+            "temperature": 0.1,
+            "max_tokens": 2400,
         }
         resp = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -217,7 +329,7 @@ def _smart_template(description: str) -> str:
 
             if __name__ == "__main__":
                 print("Starting server on http://0.0.0.0:5000")
-                app.run(host="0.0.0.0", port=5000, debug=True)
+                app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
         """)
 
     # ---- scraper / crawl / download -----------------------------------
@@ -373,6 +485,60 @@ def _smart_template(description: str) -> str:
         if __name__ == "__main__":
             main()
     """)
+
+
+def _rule_based_repair(description: str, previous_code: str, error_output: str) -> str:
+    """Best-effort local repair without external LLM APIs."""
+    lower_err = error_output.lower()
+
+    if "modulenotfounderror" in lower_err and "flask" in lower_err:
+        return textwrap.dedent(f"""\
+            # AUTO-REPAIRED: {description}
+            # Flask không có sẵn -> fallback sang server chuẩn thư viện chuẩn Python.
+            import json
+            from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+            class Handler(BaseHTTPRequestHandler):
+                def _send_json(self, code: int, payload: dict) -> None:
+                    body = json.dumps(payload).encode("utf-8")
+                    self.send_response(code)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def do_GET(self):  # noqa: N802
+                    if self.path == "/":
+                        self._send_json(200, {{"status": "ok", "message": "Hello from repaired server"}})
+                        return
+                    self._send_json(404, {{"error": "not_found"}})
+
+
+            if __name__ == "__main__":
+                host, port = "0.0.0.0", 5000
+                print(f"Starting repaired server at http://{{host}}:{{port}}")
+                HTTPServer((host, port), Handler).serve_forever()
+        """)
+
+    if "modulenotfounderror" in lower_err and "bs4" in lower_err:
+        return previous_code.replace("from bs4 import BeautifulSoup", "")
+
+    if "address already in use" in lower_err or "port 5000 is in use" in lower_err:
+        patched = previous_code
+        patched = re.sub(r"port\s*=\s*5000", "port=5001", patched)
+        patched = re.sub(r"port\s*=\s*5001", "port=5002", patched)
+        patched = patched.replace("('0.0.0.0', 5000)", "('0.0.0.0', 5001)")
+        patched = patched.replace("('0.0.0.0', 5001)", "('0.0.0.0', 5002)")
+        patched = patched.replace("(host, port)", "(host, 5001)") if "HTTPServer((host, port)" in patched else patched
+        patched = patched.replace("debug=True", "debug=False")
+        if "use_reloader=False" not in patched and "app.run(" in patched:
+            patched = patched.replace("debug=False)", "debug=False, use_reloader=False)")
+        patched = patched.replace("http://0.0.0.0:5000", "http://0.0.0.0:5001")
+        patched = patched.replace("http://0.0.0.0:5001", "http://0.0.0.0:5002")
+        return patched
+
+    return previous_code
 
 
 # ---------------------------------------------------------------------------
