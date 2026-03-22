@@ -14,6 +14,7 @@ from src.config import load_settings
 from src.binance_trader import BinanceFuturesTrader
 from src.claude_client import review_positions_with_claude
 from src.ecommerce_scanner import run_sell_scan
+from src.job_scanner import format_searchjob_report, search_remote_jobs
 from src.mmo_research import (
     fetch_affiliate_payout_status,
     format_mmo_auto_alert,
@@ -1384,6 +1385,7 @@ def _handle_command(text: str) -> tuple[str, bool, dict[str, Any] | None, bool]:
             "Commands:\n"
             "/trade hoặc /trade <target_usdt> [review_after_sec] [leverage] (multi-coin cycle)\n"
             "/sell hoặc /sell <keyword1,keyword2> (scan sản phẩm e-commerce)\n"
+            "/searchjob hoặc /searchjob <keyword> (tìm job remote)\n"
             "/mmo | /mmo auto | /mmo stop | /mmo start | /mmo steps | /mmo status | /mmo withdraw\n"
             "/run openclaw trading (single trade)\n"
             "/status\n/aiusage\n/stop"
@@ -1418,13 +1420,20 @@ def _handle_command(text: str) -> tuple[str, bool, dict[str, Any] | None, bool]:
         output = run_sell_scan(keywords=keywords)
         return _format_sell_report(output), False, output, False
 
+    if command.startswith("/searchjob"):
+        raw_text = text.strip()
+        parts = raw_text.split(maxsplit=1)
+        keyword = parts[1].strip() if len(parts) == 2 else ""
+        output = search_remote_jobs(keyword=keyword, limit=8)
+        return format_searchjob_report(output), False, output, False
+
     if command.startswith("/mmo"):
         return handle_mmo_command(text), False, None, False
 
     if command == "/trade":
         return "Đang khởi động chế độ multi-coin cycle...", False, None, False
 
-    return "Lệnh không hợp lệ. Dùng /trade, /sell, /mmo hoặc /run openclaw trading", False, None, False
+    return "Lệnh không hợp lệ. Dùng /trade, /sell, /searchjob, /mmo hoặc /run openclaw trading", False, None, False
 
 
 def run_telegram_bot() -> None:
@@ -1606,6 +1615,9 @@ def run_telegram_bot() -> None:
 
                         if text.strip().lower().startswith("/sell"):
                             _send_message(token, chat_id, "Đang quét sàn TMĐT và tìm chênh lệch giá...")
+
+                        if text.strip().lower().startswith("/searchjob"):
+                            _send_message(token, chat_id, "Đang quét job remote và lọc kết quả phù hợp...")
 
                         if text.strip().lower() == "/mmo":
                             _send_message(token, chat_id, "Đang tổng hợp các hướng self-hosted MMO an toàn từ GitHub...")
