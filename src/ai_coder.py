@@ -91,8 +91,10 @@ def _generate_with_claude(description: str, api_key: str, model: str) -> tuple[s
 def _generate_with_groq(description: str, groq_key: str) -> tuple[str, bool]:
     try:
         import requests  # type: ignore
+        # Note: Groq models change frequently, try mixtral (stable) then fallback
+        model = "mixtral-8x7b-32768"
         payload = {
-            "model": "llama3-70b-8192",
+            "model": model,
             "messages": [
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": f"Hãy viết script: {description}"},
