@@ -527,7 +527,7 @@ class OpenClawManager:
             if stripped in {"ok", "yes", "yep", "chạy", "được", "ok được", "start"}:
                 # User confirmed — start building
                 self.build_conversation_state = "BUILDING"
-                return self._start_build_task(), False
+                return self._start_build_task()
             elif stripped == "cancel" or stripped.startswith("/stop"):
                 # User cancelled
                 self.build_conversation_state = "IDLE"
@@ -625,6 +625,7 @@ class OpenClawManager:
                 return f"❌ Loi khi start server: {exc}", False
         
         # Otherwise: run normally and capture output
+        cmd = [sys.executable, str(gen_file)]
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=60, cwd=str(self.root_dir)
