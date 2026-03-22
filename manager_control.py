@@ -48,6 +48,7 @@ class OpenClawManager:
         self.running = True
         self.trade_proc: subprocess.Popen[str] | None = None
         self.mmo_proc: subprocess.Popen[str] | None = None
+        self.build_mode = False  # AI coder mode: /start build ... /stop build
         self.offset: int | None = None
         self.host = socket.gethostname()
         self.root_dir = Path(__file__).resolve().parent
@@ -335,15 +336,18 @@ class OpenClawManager:
         command = text.strip().lower()
 
         if command in {"/help", "/start manager", "/manager"}:
+            build_indicator = "✓ ON" if self.build_mode else "(off)"
             return (
                 "Manager commands:\n"
                 "/start trade   → chạy trade telegram bot\n"
                 "/start mmo     → chạy mmo telegram bot\n"
+                "/start build   → bật AI coder mode\n"
                 "/stop trade    → stop trade bot (kèm close all)\n"
                 "/stop mmo      → stop mmo bot\n"
-                "/stop force    → stop bot + dừng manager\n"
+                "/stop build    → tắt AI coder mode\n"
+                "/stop force    → stop tất cả + dừng manager\n"
                 "/status        → trạng thái processes\n"
-                "\nAI Coder (như developer trên máy):\n"
+                f"\nAI Coder mode [{build_indicator}] (như developer trên máy):\n"
                 "/command 'viết script trade coin'   → AI sinh code + lưu\n"
                 "/command 'tạo 1 website bán hàng'   → AI sinh Flask app\n"
                 "/run           → chạy file vừa được tạo, trả stdout\n"
@@ -360,6 +364,18 @@ class OpenClawManager:
         if command == "/start mmo":
             return self._start_bot("mmo"), False
 
+        if command == "/start build":
+            if self.build_mode:
+                return "Build mode đang bật rồi.", False
+            self.build_mode = True
+            return "✅ Build mode ON — sẵn sàng cho /command 'mô tả'\nDùng /stop build để tắt hoặc /stop force để dừng tất cả.", False
+
+        if command == "/stop build":
+            if not self.build_mode:
+                return "Build mode không bật.", False
+            self.build_mode = False
+            return "Build mode OFF.", False
+
         if command in {"/stop", "/stop trade"}:
             return self._stop_bot("trade", close_positions=True), False
 
@@ -369,12 +385,14 @@ class OpenClawManager:
         if command == "/stop force":
             stop_trade = self._stop_bot("trade", close_positions=True)
             stop_mmo = self._stop_bot("mmo", close_positions=False)
+            self.build_mode = False
             self.running = False
-            return f"{stop_trade}\n{stop_mmo}\nManager sẽ dừng ngay.", True
+            return f"{stop_trade}\n{stop_mmo}\nBuild mode OFF.\nManager sẽ dừng ngay.", True
 
         if command == "/status":
             trade_state = "RUNNING" if self._is_trade_running() else "STOPPED"
             mmo_state = "RUNNING" if self._is_mmo_running() else "STOPPED"
+            build_state = "ON" if self.build_mode else "OFF"
             trade_pid = self.trade_proc.pid if self._is_trade_running() and self.trade_proc else "-"
             mmo_pid = self.mmo_proc.pid if self._is_mmo_running() and self.mmo_proc else "-"
             gen_file = self.last_generated_file.name if self.last_generated_file else "(none)"
@@ -382,16 +400,21 @@ class OpenClawManager:
                 "Manager: RUNNING\n"
                 f"Trade telegram: {trade_state} | PID: {trade_pid}\n"
                 f"MMO telegram: {mmo_state} | PID: {mmo_pid}\n"
+                f"Build mode: {build_state}\n"
                 f"Last generated: {gen_file}"
             ), False
 
         # AI code generator: /command '<description>'
         codegen_result = self._handle_codegen(text)
         if codegen_result is not None:
+            if not self.build_mode:
+                return "❌ Build mode OFF. Dùng /start build trước.", False
             return codegen_result, False
 
         # /run — execute last generated file
         if command == "/run":
+            if not self.build_mode:
+                return "❌ Build mode OFF. Dùng /start build trước.", False
             if self.last_generated_file is None or not self.last_generated_file.exists():
                 return "Chưa có file nào được tạo. Dùng /command 'mô tả' trước.", False
             fp = self.last_generated_file
@@ -411,6 +434,8 @@ class OpenClawManager:
 
         # /code — show full source
         if command == "/code":
+            if not self.build_mode:
+                return "❌ Build mode OFF. Dùng /start build trước.", False
             if self.last_generated_file is None or not self.last_generated_file.exists():
                 return "Chưa có file nào được tạo. Dùng /command 'mô tả' trước.", False
             fp = self.last_generated_file
