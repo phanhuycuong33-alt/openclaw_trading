@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import datetime
 import os
 import re
 import signal
 import socket
 import subprocess
+import sys
 import textwrap
 import time
 from pathlib import Path
@@ -14,6 +16,7 @@ import requests
 from dotenv import load_dotenv
 
 from src.binance_trader import BinanceFuturesTrader
+from src.ai_coder import generate_code, slug_from_description
 
 
 load_dotenv()
@@ -48,6 +51,7 @@ class OpenClawManager:
         self.offset: int | None = None
         self.host = socket.gethostname()
         self.root_dir = Path(__file__).resolve().parent
+        self.last_generated_file: Path | None = None  # last file from /command
         self.trade_token_override = os.getenv("OPENCLAW_TELEGRAM_BOT_TOKEN", "").strip()
         self.trade_chat_override = os.getenv("OPENCLAW_TELEGRAM_ALLOWED_CHAT_ID", "").strip()
         self.mmo_token_override = os.getenv("MMO_TELEGRAM_BOT_TOKEN", "").strip()
@@ -168,6 +172,56 @@ class OpenClawManager:
             return f"{prefix}Đã force terminate {label} telegram bot (exit={code})."
 
     # ------------------------------------------------------------------
+    # AI code generator  (/command ... /run /code)
+    # ------------------------------------------------------------------
+
+    def _handle_codegen(self, text: str) -> str | None:
+        """Handle /command '<description>' — generate + save Python code via AI.
+        Returns reply string, or None if text doesn't start with /command.
+        """
+        stripped = text.strip()
+        if not re.match(r"(?i)^/command\b", stripped):
+            return None
+
+        # Extract description from the rest of the line (with or without quotes)
+        rest = re.sub(r"(?i)^/command\s*", "", stripped).strip()
+        description = rest.strip("'\"")
+        if not description:
+            return (
+                "Cú pháp: /command 'mô tả dự án'\n"
+                "Ví dụ  : /command 'viết script trade coin dùng Binance API'"
+            )
+
+        # Tell user we're working
+        slug = slug_from_description(description)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"gen_{ts}_{slug}.py"
+        out_path = self.root_dir / filename
+
+        try:
+            code, engine = generate_code(description)
+        except Exception as exc:
+            return f"Lỗi khi sinh code: {exc}"
+
+        out_path.write_text(code, encoding="utf-8")
+        self.last_generated_file = out_path
+
+        # Preview first 25 lines
+        lines = code.splitlines()
+        preview_lines = lines[:25]
+        preview = "\n".join(preview_lines)
+        if len(lines) > 25:
+            preview += f"\n... (+{len(lines)-25} dòng nữa)"
+
+        return (
+            f"✅ [{engine}] Đã tạo: {filename}\n"
+            f"Mô tả: {description}\n\n"
+            f"--- Preview ---\n"
+            f"{preview}\n\n"
+            f"Dùng /run để chạy | /code để xem toàn bộ"
+        )
+
+    # ------------------------------------------------------------------
     # Natural-language shell task handler
     # ------------------------------------------------------------------
 
@@ -197,7 +251,7 @@ class OpenClawManager:
             )
             try:
                 proc = subprocess.run(
-                    ["python3", str(script_path)],
+                    [sys.executable, str(script_path)],
                     capture_output=True, text=True, timeout=30,
                 )
                 out = proc.stdout.strip() or "(no stdout)"
@@ -259,7 +313,7 @@ class OpenClawManager:
                 if not script_path.exists():
                     return f"Không tìm thấy file '{target}' trong {self.root_dir}."
                 suffix = script_path.suffix
-                cmd = ["python3", str(script_path)] if suffix == ".py" else ["bash", str(script_path)]
+                cmd = [sys.executable, str(script_path)] if suffix == ".py" else ["bash", str(script_path)]
                 try:
                     proc = subprocess.run(
                         cmd, capture_output=True, text=True, timeout=60,
@@ -283,12 +337,17 @@ class OpenClawManager:
         if command in {"/help", "/start manager", "/manager"}:
             return (
                 "Manager commands:\n"
-                "/start trade  → chạy trade telegram bot\n"
-                "/start mmo    → chạy mmo telegram bot\n"
-                "/stop trade   → stop trade bot (kèm close all)\n"
-                "/stop mmo     → stop mmo bot\n"
-                "/stop force   → stop bot + dừng manager\n"
-                "/status       → trạng thái processes\n"
+                "/start trade   → chạy trade telegram bot\n"
+                "/start mmo     → chạy mmo telegram bot\n"
+                "/stop trade    → stop trade bot (kèm close all)\n"
+                "/stop mmo      → stop mmo bot\n"
+                "/stop force    → stop bot + dừng manager\n"
+                "/status        → trạng thái processes\n"
+                "\nAI Coder (như developer trên máy):\n"
+                "/command 'viết script trade coin'   → AI sinh code + lưu\n"
+                "/command 'tạo 1 website bán hàng'   → AI sinh Flask app\n"
+                "/run           → chạy file vừa được tạo, trả stdout\n"
+                "/code          → xem toàn bộ source file vừa tạo\n"
                 "\nShell tasks (viết tự nhiên):\n"
                 "  tao script 'hello world'  → tạo + chạy Python script\n"
                 "  down repo 'trade coin'    → clone GitHub repo\n"
@@ -318,11 +377,48 @@ class OpenClawManager:
             mmo_state = "RUNNING" if self._is_mmo_running() else "STOPPED"
             trade_pid = self.trade_proc.pid if self._is_trade_running() and self.trade_proc else "-"
             mmo_pid = self.mmo_proc.pid if self._is_mmo_running() and self.mmo_proc else "-"
+            gen_file = self.last_generated_file.name if self.last_generated_file else "(none)"
             return (
                 "Manager: RUNNING\n"
                 f"Trade telegram: {trade_state} | PID: {trade_pid}\n"
-                f"MMO telegram: {mmo_state} | PID: {mmo_pid}"
+                f"MMO telegram: {mmo_state} | PID: {mmo_pid}\n"
+                f"Last generated: {gen_file}"
             ), False
+
+        # AI code generator: /command '<description>'
+        codegen_result = self._handle_codegen(text)
+        if codegen_result is not None:
+            return codegen_result, False
+
+        # /run — execute last generated file
+        if command == "/run":
+            if self.last_generated_file is None or not self.last_generated_file.exists():
+                return "Chưa có file nào được tạo. Dùng /command 'mô tả' trước.", False
+            fp = self.last_generated_file
+            cmd = [sys.executable, str(fp)] if fp.suffix == ".py" else ["bash", str(fp)]
+            try:
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=60,
+                    cwd=str(self.root_dir),
+                )
+                out = proc.stdout.strip() or "(no stdout)"
+                err = f"\nStderr: {proc.stderr.strip()[:400]}" if proc.stderr.strip() else ""
+                return f"Run '{fp.name}' (exit {proc.returncode}):\n{out[:1500]}{err}", False
+            except subprocess.TimeoutExpired:
+                return f"Script '{fp.name}' timeout sau 60 giây.", False
+            except Exception as exc:
+                return f"Lỗi khi chạy '{fp.name}': {exc}", False
+
+        # /code — show full source
+        if command == "/code":
+            if self.last_generated_file is None or not self.last_generated_file.exists():
+                return "Chưa có file nào được tạo. Dùng /command 'mô tả' trước.", False
+            fp = self.last_generated_file
+            src = fp.read_text(encoding="utf-8")
+            # Telegram message limit 4096 chars
+            if len(src) > 3800:
+                src = src[:3800] + f"\n... (truncated, full file: {fp.name})"
+            return f"--- {fp.name} ---\n{src}", False
 
         # Natural-language shell task fallback
         shell_result = self._handle_shell_task(text)
