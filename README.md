@@ -14,7 +14,7 @@ Project này hỗ trợ 3 luồng:
 ## 1) Setup
 
 ```bash
-cd /home/huycuong/workspace/openclaw-crypto-agent
+cd openclaw_trading
 cp .env.example .env
 chmod +x run
 ```

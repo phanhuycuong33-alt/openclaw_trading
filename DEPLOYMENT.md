@@ -128,7 +128,7 @@ tmux kill-session -t openclaw  # Stop bot
 │   ├── config.py           # Settings loader
 │   ├── usage_tracker.py    # Copilot usage counter
 │   └── ...
-└── README.md               # This file
+└── README.md               # Main documentation
 ```
 
 ## Mode Reference
